@@ -1,0 +1,5 @@
+# Parity outputs that may differ until a dependency lands the fix. One output file name per line;
+# the comment above each group names the root cause and the docs/needs-from-pdf-rs.md item or the
+# docs/go-differences.md entry. diff.sh fails when a listed file matches again, so remove its line
+# in the PR that lands the fix.
+

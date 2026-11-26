@@ -1,0 +1,104 @@
+diff --git a/editpages.go b/editpages.go
+index 2404a45..f4826a7 100644
+--- a/editpages.go
++++ b/editpages.go
+@@ -22,7 +22,6 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"slices"
+-	"time"
+ 
+ 	"github.com/dobbo-ca/byblos/internal/pdfdoc"
+ )
+@@ -244,7 +243,7 @@ func buildRecord(ctx context.Context, pages []PageSource) (rec Provenance, delta
+ 
+ 	out := Provenance{
+ 		Version:     Version,
+-		ProcessedAt: time.Now().UTC(),
++		ProcessedAt: timeNow().UTC(),
+ 		// Output is never linearized; see BuildFromPages.
+ 		Optimized: "rewritten-delinearized",
+ 	}
+diff --git a/internal/pdfdoc/buildpages.go b/internal/pdfdoc/buildpages.go
+index 00dfd66..22b57cd 100644
+--- a/internal/pdfdoc/buildpages.go
++++ b/internal/pdfdoc/buildpages.go
+@@ -70,7 +70,9 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"io"
++	"maps"
+ 	"math"
++	"slices"
+ 
+ 	"github.com/dobbo-ca/byblos/internal/limits"
+ 	"github.com/dobbo-ca/pdf-go/pkg/pdfcpu"
+@@ -556,7 +558,10 @@ func (m *migration) migratePage(d *doc, p PageSource, nr int) error {
+ 	}
+ 
+ 	out := types.Dict{}
+-	for key, val := range pd {
++	// Parity patch: copy in sorted key order, so the object numbers do not depend on the
++	// map iteration order.
++	for _, key := range slices.Sorted(maps.Keys(pd)) {
++		val := pd[key]
+ 		// /Parent names the SOURCE page tree, and the output's is assigned
+ 		// below. reference would return null for it in any case; skipping it
+ 		// here says why rather than leaving a null to be explained.
+@@ -793,7 +798,8 @@ func (m *migration) copy(d *doc, o types.Object) (types.Object, error) {
+ 
+ func (m *migration) copyDict(d *doc, in types.Dict) (types.Dict, error) {
+ 	out := make(types.Dict, len(in))
+-	for k, v := range in {
++	for _, k := range slices.Sorted(maps.Keys(in)) { // parity patch: sorted, as above
++		v := in[k]
+ 		cp, err := m.copy(d, v)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("/%s: %w", k, err)
+diff --git a/optimize.go b/optimize.go
+index 05f7066..9a885de 100644
+--- a/optimize.go
++++ b/optimize.go
+@@ -9,7 +9,6 @@ import (
+ 	"image/jpeg"
+ 	"io"
+ 	"slices"
+-	"time"
+ 
+ 	"github.com/dobbo-ca/byblos/internal/pdfdoc"
+ )
+@@ -217,7 +216,7 @@ func OptimizeLimits(ctx context.Context, w io.Writer, r io.ReadSeeker, opts Opti
+ 		// own doc comment warns against.
+ 		prov = &Provenance{
+ 			Version:     Version,
+-			ProcessedAt: time.Now(),
++			ProcessedAt: timeNow(),
+ 		}
+ 	}
+ 	if len(applied) > 0 {
+diff --git a/provenance.go b/provenance.go
+index c62bd81..4674e09 100644
+--- a/provenance.go
++++ b/provenance.go
+@@ -320,6 +320,12 @@ var buildCapabilities = []string{
+ 	"text-layer",
+ }
+ 
++// timeNow is the clock behind every ProcessedAt stamp. Parity harness hook.
++var timeNow = time.Now
++
++// SetTimeNow replaces the clock behind every ProcessedAt stamp. Parity harness hook.
++func SetTimeNow(f func() time.Time) { timeNow = f }
++
+ // Capabilities returns, sorted, what this build can do.
+ func Capabilities() []string {
+ 	out := slices.Clone(buildCapabilities)
+@@ -475,7 +481,7 @@ func RecordExtractionLimits(ctx context.Context, r io.ReadSeeker, lim Limits) (P
+ 	p := Provenance{
+ 		Version:      Version,
+ 		Capabilities: []string{"extract-raster"},
+-		ProcessedAt:  time.Now(),
++		ProcessedAt:  timeNow(),
+ 		Pages:        make([]PageProvenance, 0, d.PageCount()),
+ 	}
+ 	if old != nil {

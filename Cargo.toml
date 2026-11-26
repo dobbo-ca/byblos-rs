@@ -1,0 +1,30 @@
+[package]
+name = "byblos"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+description = "PDF pipeline for scanned documents: page inspection, single-raster extraction, Sauvola binarisation, JBIG2, quantisation, image-to-PDF building, OCR text layers, optimisation, linearisation, provenance and thumbnails, with strict resource limits. Rust port of github.com/dobbo-ca/byblos."
+publish = false
+
+# The dobbo-ca ports, pinned by rev (never crates.io). pdf is the PDF reader and writer
+# (pdf-go's port). jpeg and deflate are at the revs pdf-rs pins, so one copy of each links and
+# their types in pdf-rs's API (`pdf::Error::{Jpeg, Flate}`, `gojpeg::GoImage`) are byblos's own.
+# See docs/dependencies.md.
+# png is the PNG decoder (png-rs, Go image/png behaviour under Profile::Go); png_read adapts its
+# output to Go's image types. It pins its own deflate-rs rev, bumped
+# separately from byblos's.
+[dependencies]
+pdf = { git = "https://github.com/dobbo-ca/pdf-rs", rev = "3854d8e878adf27dd7edfa733baa38e05adf65dd" }
+jpeg = { git = "https://github.com/dobbo-ca/jpeg-rs", rev = "c0cf0fcc3a5c4284bf09615cea44660247f07e99" }
+deflate = { git = "https://github.com/dobbo-ca/deflate-rs", rev = "211232f521f4378efd74f224df2fc05213cec94a" }
+png = { git = "https://github.com/dobbo-ca/png-rs", rev = "1a4cd765bb78b9c81b4efe3e1f0c9427dec5d727" }
+
+# The tests decode and render whole pages; the dependencies run optimised under `cargo test`,
+# this crate keeps overflow checks and debug assertions.
+[profile.dev.package."*"]
+opt-level = 2
+
+# One codegen unit, so the decode loops inline across modules.
+[profile.release]
+codegen-units = 1

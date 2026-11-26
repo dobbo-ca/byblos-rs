@@ -1,0 +1,1842 @@
+// Package pdfdoc is the only package in Byblos that imports pdfcpu.
+//
+// Everything above it speaks in the types declared here, so replacing the
+// underlying PDF library is a change to this package alone (design spec
+// section 3). arch_test.go in the repository root enforces that.
+//
+// pdfcpu API notes, verified against v0.15.0:
+//
+//   - api.ReadAndValidate dereferences conf.Cmd with no nil check and pdfcpu's
+//     fault.Catch only recovers its own panic type, so passing a nil
+//     *model.Configuration kills the process rather than returning an error.
+//     Every call here passes defaultConfig().
+//   - model.NewDefaultConfiguration builds pdfcpu's package-level default
+//     LAZILY, on first use, and writes it with no synchronisation, so two
+//     goroutines opening documents at once race inside pdfcpu itself.
+//     defaultConfig forces that init exactly once; see its comment (byb-a5z).
+//   - ctx.PageCount is zero after ReadContext; ctx.EnsurePageCount() populates it.
+//   - types.StreamDict.Content is empty until Decode() is called.
+//   - model.Image.Width/Height/Bpc are zero unless ExtractImage is called with
+//     stub=true, and a stub carries no pixels. Pixel dimensions therefore come
+//     from the image XObject's own stream dictionary.
+//   - pdfcpu cannot decode JBIG2Decode or JPXDecode and returns the raw opaque
+//     bytes with FileType "jbig2"/"jpx" rather than erroring. Callers must check
+//     the file type; extract.go does.
+//   - pdfcpu.RenderImage returns (nil, "", nil) for any other unhandled filter,
+//     and ExtractImage passes that straight through as a model.Image with a nil
+//     embedded Reader. Reading it panics, so RawImage guards and returns
+//     ErrUnsupportedCodec instead.
+//   - types.Dict's typed accessors (IntEntry, DictEntry, ArrayEntry, ...) do NOT
+//     dereference an indirect reference; they return zero. Real documents do use
+//     an indirect /Resources on a Form XObject, so every dictionary read that
+//     feeds a Byblos type goes through the deref helpers at the bottom of this
+//     file.
+//   - pdfcpu's own page tree walk falls into that same trap: it reads /Kids with
+//     ArrayEntry, so a /Pages node holding an indirect /Kids looks childless and
+//     PageDict returns that node as the dictionary of every page, with no error.
+//     Open repairs the tree before anything walks it; see normalizePageTree.
+package pdfdoc
+
+import (
+	"bytes"
+	"compress/flate"
+	"context"
+	"errors"
+	"fmt"
+	"hash/adler32"
+	"io"
+	"strings"
+	"sync"
+
+	"github.com/dobbo-ca/byblos/internal/content"
+	"github.com/dobbo-ca/byblos/internal/dct"
+	"github.com/dobbo-ca/byblos/internal/limits"
+	"github.com/dobbo-ca/pdf-go/pkg/api"
+	"github.com/dobbo-ca/pdf-go/pkg/filter"
+	"github.com/dobbo-ca/pdf-go/pkg/pdfcpu"
+	"github.com/dobbo-ca/pdf-go/pkg/pdfcpu/model"
+	"github.com/dobbo-ca/pdf-go/pkg/pdfcpu/types"
+)
+
+var configOnce sync.Once
+
+// defaultConfig returns a FRESH pdfcpu configuration, having forced pdfcpu's
+// lazy global initialisation to happen exactly once.
+//
+// Two separate facts make this the shape it is, and getting either wrong
+// reintroduces a race (byb-a5z).
+//
+// First, the init is lazy and unsynchronised. model.NewDefaultConfiguration
+// reaches EnsureDefaultConfigAt -> ensureConfigFileAt -> parseConfigFile, which
+// WRITES a pdfcpu package-level variable on the first call in the process while
+// a concurrent caller READS it. Measured with -race against pdfcpu v0.15.0: 9
+// data races from 8 goroutines calling Open at once, and none once this
+// serialises the first call.
+//
+// Second, the configuration itself is NOT shareable. pdfcpu mutates the
+// *model.Configuration it is handed -- it carries per-operation state -- so
+// returning one cached instance would trade the init race for a worse one on
+// every field. Each caller still gets its own; only the global init is
+// serialised.
+func defaultConfig() *model.Configuration {
+	configOnce.Do(func() { _ = model.NewDefaultConfiguration() })
+	conf := model.NewDefaultConfiguration()
+	// pdfcpu defaults to 512 MiB per decode and 10M objects; every entry point
+	// takes the package defaults. openDoc narrows them to the caller's Limits.
+	conf.Limits.MaxDecodeBytes = limits.Limits{}.StreamBytes()
+	conf.Limits.MaxObjectCount = int(limits.Limits{}.Objects())
+	conf.Limits.MaxObjectStreamTotalCount = int(limits.Limits{}.Objects())
+	conf.Limits.MaxTotalDecodeBytes = limits.Limits{}.StreamBytes()
+	conf.Limits.MaxObjectBytes = limits.Limits{}.ObjectBytes()
+	conf.Limits.MaxParsedBytes = parsedBytes(limits.Limits{}, limits.ObjectTableBytes(limits.Limits{}.Objects()))
+	return conf
+}
+
+// pdfcpuLimit is the *LimitError for a refusal by one of pdfcpu's cumulative
+// limits (object stream entries, decoded bytes per parse) or its per-stream
+// decode cap, and nil for any other error.
+func pdfcpuLimit(lim limits.Limits, err error) error {
+	switch {
+	case errors.Is(err, model.ErrObjectBytesExceeded):
+		return &limits.LimitError{Name: "object-bytes", Got: lim.ObjectBytes() + 1, Max: lim.ObjectBytes()}
+	case errors.Is(err, model.ErrStreamTotalLimitExceeded):
+		return &limits.LimitError{Name: "file-stream-bytes", Got: lim.MaxStreamTotalBytes + 1, Max: lim.MaxStreamTotalBytes}
+	case errors.Is(err, model.ErrParsedLimitExceeded):
+		n := parsedBytes(lim, limits.ObjectTableBytes(lim.Objects()))
+		return &limits.LimitError{Name: "parsed-bytes", Got: n + 1, Max: n}
+	case errors.Is(err, model.ErrLimitExceeded) && errors.Is(err, filter.ErrDecodeLimitExceeded):
+		return &limits.LimitError{Name: "stream-bytes", Got: lim.TotalDecodeBytes() + 1, Max: lim.TotalDecodeBytes()}
+	case errors.Is(err, model.ErrLimitExceeded):
+		return &limits.LimitError{Name: "objects", Got: lim.ObjectStreamEntries() + 1, Max: lim.ObjectStreamEntries()}
+	case errors.Is(err, filter.ErrDecodeLimitExceeded):
+		return &limits.LimitError{Name: "stream-bytes", Got: lim.StreamBytes() + 1, Max: lim.StreamBytes()}
+	}
+	return nil
+}
+
+// ErrUnsupportedCodec reports an image stream whose compression filter pdfcpu
+// will not render. It exists so that pdfcpu's nil-reader return becomes an
+// error at this seam instead of a nil dereference in the caller.
+//
+// It is NOT returned for JBIG2 or JPX: those come back as real bytes with a
+// file type naming the codec, and deciding what to do about them is extract.go's
+// job, not this package's.
+var ErrUnsupportedCodec = errors.New("byblos/pdfdoc: image codec cannot be rendered")
+
+// ErrMalformed reports a document pdfcpu could not parse without panicking.
+//
+// pdfcpu indexes unchecked in several parsers — skipTJ walks off an empty
+// operand slice on a malformed TJ array. Its own fault.Catch recovers only its
+// own panic type, so nothing below this package stops it.
+//
+// skipTJ is reached from pdfcpu's parseContent, which runs only when PageDict
+// is asked to consolidate resources. Page and Annots no longer ask (byb-ged),
+// so that crash no longer arrives from what looks like a dictionary read — but
+// Optimize still reaches it, because api.Optimize calls PageDict(i, true)
+// itself.
+//
+// A library for processing archives cannot die on one damaged file out of five
+// thousand, which is what this cost before byb-avp: a whole run lost, and not
+// even a counter left behind to say a page had been skipped. Recovering at
+// this seam is what makes a malformed page an outcome the caller can count
+// rather than an exit. It is the same boundary ErrUnsupportedCodec sits on —
+// pdfcpu's misbehaviour becomes a Byblos error here or nowhere.
+var ErrMalformed = errors.New("byblos/pdfdoc: malformed document")
+
+// catchPanic converts a panic from pdfcpu into *err.
+//
+// Deferred with a named return, so it can only turn a crash into an error and
+// never mask one that was already being returned.
+func catchPanic(what string, err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("%w: %s: %v", ErrMalformed, what, r)
+	}
+}
+
+// Rect is a rectangle in PDF default user space: points, origin lower-left,
+// y increasing upward.
+type Rect struct{ LLX, LLY, URX, URY float64 }
+
+// ImageInfo describes an image XObject as its own dictionary declares it.
+//
+// SMask, Mask and ImageMask are the three ways an image can fail to be an
+// opaque rectangle of pixels. They are recorded as presence, not as content:
+// what the mask actually does needs a renderer, and for deciding whether this
+// image hides what is painted under it, "it has one" is the whole answer.
+type ImageInfo struct {
+	Name          string
+	ObjNr         int
+	Width, Height int  // pixels
+	BPC           int  // /BitsPerComponent; 0 when absent
+	ImageMask     bool // /ImageMask: a stencil painted in the fill colour
+	SMask         bool // /SMask: a soft mask supplies per-pixel alpha
+	Mask          bool // /Mask: a stencil mask or a colour-key range
+	Decode        bool // /Decode is present: the samples need a remap
+
+	// DecodeArray is /Decode's elements when every one of them is a number,
+	// and nil otherwise — either the entry is absent, or it is present in a
+	// shape this cannot read.
+	//
+	// Decode and this field answer different questions and a caller must pick
+	// the one it means. "Is there a remap at all" is Decode, and an entry whose
+	// numbers could not be read is still a remap; optimize.go's eligibility
+	// test reads it that way. "What is the remap" is this, and nil means there
+	// is none to be had — never that the samples pass through unchanged.
+	//
+	// The values are as written. This does not supply the default array for an
+	// absent entry, because the default depends on the colour space and the
+	// bit depth (ISO 32000-1 table 39) and ColorSpace is deliberately not
+	// resolved here.
+	DecodeArray []float64
+
+	// Filter is the image codec the stream declares: /Filter when it is a
+	// name, the LAST entry when it is an array, and "" when /Filter is absent
+	// (an unencoded stream) or is neither of those shapes.
+	//
+	// Last, not first, because a filter array is the DECODE order (ISO 32000-1
+	// section 7.4): in /Filter [/ASCII85Decode /JBIG2Decode] the ASCII85 stage
+	// only unwraps the transport encoding and the image codec is JBIG2Decode.
+	// Reading the first entry would report a chained JBIG2 image as ASCII85 and
+	// undercount exactly the class this field exists to find.
+	//
+	// It is a declaration, like everything else here — RawImage still reports
+	// what pdfcpu actually made of the bytes. The two disagree when a file lies
+	// about its own encoding.
+	Filter string
+
+	// ColorSpace is /ColorSpace when it is a plain name ("DeviceGray",
+	// "DeviceRGB", "DeviceCMYK"), and "" when it is an array or an indirect
+	// reference -- Indexed, ICCBased, Separation, DeviceN. Recompression uses
+	// it as an eligibility test, not as colour management: replacing a
+	// /Separation with /DeviceGray inverts the ink convention (in Separation,
+	// 0 is no ink and therefore white; in DeviceGray, 0 is black), so
+	// anything that is not a device name is left alone.
+	ColorSpace string
+}
+
+// Page is one page's geometry, content, and resource scope.
+type Page struct {
+	Index    int // 1-based
+	MediaBox Rect
+	CropBox  Rect // equals MediaBox when the page declares none
+	Rotate   int
+	Content  []byte // decoded, concatenated
+	Scope    int    // resource scope handle for content.Env
+	// MediaBoxDefaulted reports that the document declared no /MediaBox
+	// anywhere in this page's inheritance chain, so MediaBox is the US Letter
+	// convention rather than anything the file states. See Page(), and byb-8ly
+	// for the nine govdocs1 files that made it necessary.
+	MediaBoxDefaulted bool
+
+	// ContentRecovered reports that at least one of this page's content streams
+	// failed its integrity check and Content holds the bytes that decoded
+	// anyway. See pageContents, and byb-3iw for the ten corpus pages that made
+	// it necessary.
+	//
+	// It does NOT say bytes were lost. A corrupted Adler-32 trailer alone still
+	// yields the whole stream, because zlib checks the trailer only after the
+	// last deflate block; a mid-stream corruption really does truncate. What the
+	// flag states in both cases is that Content does not match what the file
+	// attests to, and, like MediaBoxDefaulted, stating that is better than the
+	// two alternatives: pdfcpu v0.13 kept these bytes SILENTLY, and v0.15
+	// refuses the page and loses content poppler reads.
+	//
+	// KNOWN LIMIT, measured: the flag reports a failure pdfcpu REPORTED. A single
+	// stream truncated mid-deflate-block is one pdfcpu truncates itself, silently,
+	// returning the short prefix with no error at all -- so byblos keeps exactly
+	// the bytes v0.13 kept but cannot flag them without inflating every content
+	// stream a second time, which would double the decode cost of every page to
+	// annotate a rare one. The ARRAY case, which is the corpus's actual damage
+	// (byb-3iw's 150277 p25), is detected and flagged.
+	ContentRecovered bool
+}
+
+// defaultPageWidthPt, defaultPageHeightPt are US Letter, the box every reader
+// falls back to for a page that declares none. Poppler reports exactly this for
+// the byb-8ly documents, which is a convention it applies and not a fact it
+// read out of them.
+const (
+	defaultPageWidthPt  = 612
+	defaultPageHeightPt = 792
+)
+
+// Doc is a parsed PDF and the seam Byblos keeps between itself and pdfcpu.
+type Doc interface {
+	PageCount() int
+	Page(n int) (*Page, error)
+	// Annots returns page n's annotations. They are not part of Page because
+	// nothing in classification reads them yet; see annots.go.
+	Annots(n int) ([]Annot, error)
+	// XObject, ExtGStateOpaque and Font implement content.Env.
+	XObject(scope int, name string) (content.XObject, bool)
+	ExtGStateOpaque(scope int, name string) bool
+	Font(scope int, name string) (int, bool)
+	// RenderFont resolves the named /Font resource to what the renderer's
+	// font seam needs: the dict facts plus the decoded embedded program, if
+	// any. See the method for what is refused.
+	RenderFont(scope int, name string) (RenderFont, bool)
+	// ImageInfo returns the dictionary facts for an image resolved by XObject,
+	// keyed by the ID that XObject returned.
+	ImageInfo(id int) (ImageInfo, bool)
+	// Err is the first limit breach a lookup that can only answer "no" had to
+	// swallow (a form XObject over a stream cap); nil otherwise. Inspect checks
+	// it after each page.
+	Err() error
+	// Limits is the caps the document was opened under, as OpenBudgeted lowered
+	// them.
+	Limits() limits.Limits
+	// Catalog reports the signature and dynamic-XFA flags; see catalog.go.
+	Catalog() CatalogInfo
+	// EncryptInfo reports whether this document carries an /Encrypt
+	// dictionary, and its /P, /V, /R when so. See encryptinfo.go.
+	EncryptInfo() EncryptInfo
+	// RawImage renders an image previously resolved by XObject and returns its
+	// bytes and the file type pdfcpu inferred. The id is the one XObject
+	// returned; an id this document has not resolved is an error. A decode
+	// takes its memory from byblos's budget first, waiting under ctx.
+	RawImage(ctx context.Context, id int) (data []byte, fileType string, err error)
+	// RawImageGlobals returns the JBIG2 page-0 segments an image's
+	// /DecodeParms names in /JBIG2Globals, decoded, and nil when it names
+	// none. See the method for why it is separate from RawImage.
+	RawImageGlobals(id int) ([]byte, error)
+	// ReplaceImage and Write are the write half; see write.go. They are on the
+	// same interface because writing requires the context Open normalized, so
+	// there is no way to reach them from a document Byblos did not read.
+	ReplaceImage(id int, img EncodedImage) error
+	Write(w io.Writer) error
+	// AddFontResource and AppendContent are the invisible-text write half; see
+	// text.go. Same reason as ReplaceImage/Write: they need Open's normalized
+	// context.
+	AddFontResource(n int, f TrueTypeFont) (name string, err error)
+	AppendContent(n int, ops []byte) error
+	// WrapContent brackets page n's whole content with before and after, as
+	// two new streams; see text.go.
+	WrapContent(n int, before, after []byte) error
+}
+
+type doc struct {
+	ctx       *model.Context
+	scopes    []scope
+	images    map[int]ImageInfo
+	streams   map[int]*types.StreamDict    // image stream dicts, keyed like images
+	refs      map[int]types.IndirectRef    // xref identity of those streams, for writing
+	nextID    int                          // synthetic ids for direct (non-indirect) image objects
+	fontRefs  map[string]types.IndirectRef // embedded fonts, keyed by TrueTypeFont.BaseFont
+	fontCache map[int]fontCacheEntry       // RenderFont results, keyed like images
+	numArrays map[int][]float64            // numberArray results for indirect arrays, keyed by object number
+
+	lim       limits.Limits
+	pageBytes int64          // decoded non-image stream bytes of the current page
+	pageForms map[int][]byte // decoded forms already counted in pageBytes, shared by every Do of one form
+	limitErr  error          // first limit breach a bool-returning lookup had to swallow
+}
+
+type scope struct {
+	res    types.Dict
+	parent int // -1 for a page scope
+}
+
+// Open parses rs. It does not run pdfcpu's validator: real scanner output
+// exercises relaxed paths, and rejecting a readable file helps nobody. The
+// validation gate belongs to Optimize (B5) and to the caller's policy.
+//
+// rs is read once, here. Nothing below re-reads it, so a file this function
+// accepts cannot later be rejected by a validator Byblos opted out of.
+func Open(rs io.ReadSeeker) (Doc, error) {
+	return openDoc(context.Background(), rs, limits.Limits{})
+}
+
+// OpenLimits is Open under the caps of lim, reserving nothing from the memory
+// budget.
+func OpenLimits(ctx context.Context, rs io.ReadSeeker, lim limits.Limits) (Doc, error) {
+	return openDoc(ctx, rs, lim)
+}
+
+// OpenBudgeted is Open under lim, with the object table and one stream decode
+// reserved from the package memory budget (limits.SetMemoryLimit) before pdfcpu
+// parses. The returned release gives the reservation back; call it when done
+// with the document. The reservation comes from objectsIn: the larger of the
+// trailer /Size and the count of "obj" headers, found in one pass before pdfcpu
+// reads anything, because pdfcpu rebuilds the table by scanning whenever it
+// distrusts the trailer and that scan ignores its object-count cap. pdfcpu's
+// cap is held to that count (plus an eighth), and the objects packed in object
+// streams, which have no header, to the same count in total.
+//
+// The decode slot is 4 x the stream cap, but never more than the budget leaves
+// after the table: lim's stream cap is lowered to fit, so a budget that cannot
+// hold a 64 MiB decode still takes the document, and refuses only a stream
+// that would not fit.
+func OpenBudgeted(ctx context.Context, rs io.ReadSeeker, lim limits.Limits) (Doc, func(), error) {
+	size := objectsIn(rs)
+	if err := limits.Check("objects", size, lim.Objects()); err != nil {
+		return nil, nil, err
+	}
+	budget := limits.MemoryLimit()
+	const minStream = 1 << 20
+	// A linearized file's last trailer can sit a few entries under the real
+	// count, so the cap has a margin; it is the most an understated /Size parses
+	// unreserved.
+	lim.MaxObjects = min(size+size/8+64, lim.Objects())
+	streams, total := lim.StreamBytes(), lim.TotalDecodeBytes()
+	// pdfcpu keeps the raw bytes of every stream it reads, referenced or not, so
+	// the parse holds up to the file's size; the walk keeps its image records
+	// for all pages. Both come off the budget before the decode slot.
+	fileBytes := sizeOf(rs)
+	var records, retained int64
+	if budget > 0 {
+		avail := budget - limits.ObjectTableBytes(size) - fileBytes
+		records = max(avail/8, 0)
+		// A page's walk keeps its paints, text shows and strings while the
+		// page's streams are decoded: a fifth of the avail, more than that
+		// only for the record caps at their maximum (about 66 MiB).
+		retained = min(max(avail/5, 0), lim.RetainedBytes())
+		lim.MaxRetainedBytes = max(retained, 1)
+		slot := max((avail-records-retained)/4, minStream)
+		// Pages can share one content stream, so the records of all pages count
+		// together: the cap on each kind is half of what the reservation holds.
+		lim.MaxImages = min(lim.Images(), records/limits.ImageRecordBytes/2)
+		lim.MaxInlineImages = min(lim.InlineImages(), records/limits.ImageRecordBytes/2)
+		streams, total = min(streams, slot), min(total, slot)
+		// The page's decoded streams are held while the next one decodes, so
+		// together they fit the slot, not the 128 MiB default.
+		lim.MaxPageStreamBytes = min(lim.PageStreamBytes(), max(streams, total))
+		// The object buffer peaks at about 2.25x its size and a string parsed
+		// from it aliases it, so it fits the slot too.
+		lim.MaxObjectBytes = min(lim.ObjectBytes(), slot)
+		// pdfcpu holds a stream once per xref entry that reads it, so the
+		// file's size is not a bound on its own: hold the reads to it.
+		lim.MaxStreamTotalBytes = fileBytes
+	}
+	lim.MaxStreamBytes, lim.MaxTotalDecodeBytes = streams, total
+	// One reservation for the document's life: the object table and the slot its
+	// stream decodes (one at a time) run in. A decode that reserved for itself
+	// while the document held its table would wait on that table, alone or
+	// against other documents doing the same, until ctx ended.
+	release, err := limits.Reserve(ctx, limits.ObjectTableBytes(size)+fileBytes+records+retained+limits.DecodeBytes(max(streams, total, lim.ObjectBytes())))
+	if err != nil {
+		return nil, nil, err
+	}
+	d, err := openSized(ctx, rs, lim, size)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return d, release, nil
+}
+
+// openDoc is Open with the caps of lim. The /Size cap is checked before the parse
+// on every path; only OpenBudgeted also reserves memory.
+func openDoc(cctx context.Context, rs io.ReadSeeker, lim limits.Limits) (Doc, error) {
+	return openSized(cctx, rs, lim, objectsIn(rs))
+}
+
+// openSized is openDoc given the object count objectsIn found.
+func openSized(cctx context.Context, rs io.ReadSeeker, lim limits.Limits, size int64) (d Doc, err error) {
+	defer catchPanic("open", &err)
+	if err := limits.Check("objects", size, lim.Objects()); err != nil {
+		return nil, err
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("byblos/pdfdoc: seek: %w", err)
+	}
+	conf := defaultConfig()
+	// pdfcpu decodes object streams and image streams under
+	// Limits.MaxDecodeBytes, which defaults to 512 MiB; RawImage raises it per
+	// image to that image's declared size. The object-count cap is the backstop
+	// for a trailer that understates /Size.
+	conf.Limits.MaxDecodeBytes = lim.StreamBytes()
+	conf.Limits.MaxObjectCount = int(lim.Objects())
+	conf.Limits.MaxObjectBytes = lim.ObjectBytes()
+	// The cumulative limits of pdf-go: pdfcpu reads an object stream's /N
+	// by its own rules, which no scan here tracks, so it counts the entries and
+	// the decoded bytes of the parse itself and refuses at the limit.
+	conf.Limits.MaxObjectStreamTotalCount = int(lim.ObjectStreamEntries())
+	conf.Limits.MaxTotalDecodeBytes = lim.TotalDecodeBytes()
+	conf.Limits.MaxParsedBytes = parsedBytes(lim, limits.ObjectTableBytes(size))
+	conf.Limits.MaxStreamTotalBytes = lim.MaxStreamTotalBytes
+	ctx, err := api.ReadContext(cctx, rs, conf)
+	if err != nil {
+		if le := pdfcpuLimit(lim, err); le != nil {
+			return nil, le
+		}
+		// A trailer that understates /Size is caught by pdfcpu's own count, untyped.
+		if strings.Contains(err.Error(), "xref subsection object range exceeds limit") {
+			return nil, &limits.LimitError{Name: "objects", Got: lim.Objects() + 1, Max: lim.Objects()}
+		}
+		return nil, fmt.Errorf("byblos/pdfdoc: read: %w", err)
+	}
+	if err := ctx.EnsurePageCount(); err != nil {
+		if le := pdfcpuLimit(lim, err); le != nil {
+			return nil, le
+		}
+		return nil, fmt.Errorf("byblos/pdfdoc: page count: %w", err)
+	}
+	if err := limits.Check("pages", int64(ctx.PageCount), lim.Pages()); err != nil {
+		return nil, err
+	}
+	if root, err := ctx.XRefTable.Pages(); err == nil && root != nil {
+		normalizePageTree(ctx.XRefTable, *root, map[int]bool{})
+	}
+	return &doc{
+		ctx:     ctx,
+		images:  map[int]ImageInfo{},
+		streams: map[int]*types.StreamDict{},
+		refs:    map[int]types.IndirectRef{},
+		nextID:  -1,
+		lim:     lim,
+	}, nil
+}
+
+// normalizePageTree replaces an indirect /Kids with the array it refers to,
+// throughout the page tree.
+//
+// ISO 32000-1 section 7.3.10 allows any object that is not a stream to be
+// indirect, and Google Books PDF Converter writes /Kids that way. pdfcpu reads
+// /Kids with types.Dict.ArrayEntry, which returns nil for an indirect reference
+// instead of following it, so such a node has no children as far as the walk is
+// concerned. The walk treats a childless node as the page it was looking for:
+// PageDict then returns the /Pages node itself for every page number, with no
+// error, and that dictionary has neither /MediaBox nor /Contents.
+//
+// Repairing at Open rather than reacting to the symptom in Page is deliberate.
+// A missing /MediaBox is only how the damage shows when the bad node is the
+// root; an intermediate /Pages node that happens to carry inheritable
+// attributes yields a page dict that looks entirely plausible and is silently
+// the wrong page.
+//
+// Rewriting the parsed dictionary is enough: pdfcpu re-reads the object from
+// the same xref table on every call, so every later read sees the repair.
+//
+// This comment used to end "and Byblos never writes this context back out",
+// which the write half made false. Write serializes THIS context (write.go),
+// and the repair is load-bearing for it rather than incidental: on the
+// 'indirect-kids' corpus document a bare read-then-write yields 594 bytes and
+// zero pages, with a nil error and a clean re-read. Because Write is a method
+// on the doc Open returns, no caller can reach the writer around this.
+func normalizePageTree(xt *model.XRefTable, ref types.IndirectRef, seen map[int]bool) {
+	objNr := ref.ObjectNumber.Value()
+	if seen[objNr] {
+		// A cycle, or a node reachable twice. pdfcpu rejects both when it walks
+		// the tree; this pass only has to avoid looping before it gets there.
+		return
+	}
+	seen[objNr] = true
+
+	d, err := xt.DereferenceDict(ref)
+	if err != nil || d == nil {
+		return
+	}
+	kids, ok := d.Find("Kids")
+	if !ok {
+		return // a leaf page
+	}
+	arr, err := xt.DereferenceArray(kids)
+	if err != nil || arr == nil {
+		return
+	}
+	d["Kids"] = arr
+	for _, k := range arr {
+		if kr, ok := k.(types.IndirectRef); ok {
+			normalizePageTree(xt, kr, seen)
+		}
+	}
+}
+
+func (d *doc) PageCount() int { return d.ctx.PageCount }
+
+func (d *doc) Page(n int) (p *Page, err error) {
+	defer catchPanic(fmt.Sprintf("page %d", n), &err)
+	if n < 1 || n > d.ctx.PageCount {
+		return nil, fmt.Errorf("byblos/pdfdoc: page %d out of range 1..%d", n, d.ctx.PageCount)
+	}
+	xt := d.ctx.XRefTable
+	// consolidateRes=false, for the reasons text.go's AddFontResource already
+	// gives, plus one it could not see (byb-ged). true does two things, and
+	// Byblos wants neither:
+	//
+	//   - It PRUNES the returned resource dict to the names pdfcpu found in the
+	//     page's OWN content stream, never descending into a form's content to
+	//     do it (pdfcpu's own TODO on consolidateResourcesWithContent). This
+	//     dict becomes Page.Scope, so an image only a Form XObject paints is
+	//     deleted from the scope the form resolves through, and Inspect reports
+	//     a page with fewer images and no error at all. Measured: govdocs1
+	//     500973.pdf page 1 reported 1 image where pdfimages lists 5.
+	//   - It rejects the page outright when the content names a resource
+	//     category the dict does not declare ("missing required resource
+	//     subdict"), and, via its own content parse, on "corrupt BI expression"
+	//     and "corrupt page content". Because Inspect walks every page, that
+	//     loses the WHOLE document: 8 of 4,840 govdocs1 files, all of which
+	//     poppler reads.
+	//
+	// Neither loss buys anything, because pdfcpu is parsing bytes Byblos parses
+	// itself: content.Walk produces its own, better-located errors on the same
+	// documents. And nothing here reads a page-level colour space — ImageInfo
+	// takes /ColorSpace off the image XObject's own dictionary — so the subdict
+	// this used to insist on cannot change a number Inspect reports.
+	//
+	// What false gives up is pdfcpu's non-standard MERGE of a page's own
+	// /Resources with an ancestor /Pages node's. ISO 32000-1 7.7.3.4 makes
+	// /Resources inheritable, not additive: a page that declares one gets its
+	// own, and poppler agrees. Measured over the same 4,840 documents, no file
+	// changed answer because of it.
+	pd, _, inh, err := xt.PageDict(context.Background(), n, false)
+	if err != nil {
+		// Object streams are decoded when first read, so the cumulative limits can end a page.
+		if le := pdfcpuLimit(d.lim, err); le != nil {
+			return nil, le
+		}
+		return nil, fmt.Errorf("byblos/pdfdoc: page %d dict: %w", n, err)
+	}
+	if pd == nil || inh == nil {
+		return nil, fmt.Errorf("byblos/pdfdoc: page %d has no dictionary", n)
+	}
+
+	// A page with no /MediaBox anywhere in its inheritance chain is malformed:
+	// ISO 32000-1 7.7.3.3 makes it a required inheritable attribute. Byblos used
+	// to refuse the whole document, and byb-8ly measured what that cost: nine of the
+	// 4,840 govdocs1 sample files, every one PDF 1.0, none using object streams, with
+	// the string "MediaBox" absent from the file's bytes altogether. Poppler
+	// reads all 9.
+	//
+	// It defaults instead, to the US Letter box poppler defaults to, and SAYS SO
+	// through MediaBoxDefaulted. That flag is not decoration: 612x792 is a
+	// convention, not a measurement of the document, and a caller deciding
+	// whether a raster covers the page is entitled to know its page box was
+	// supplied rather than read. Refusing nine readable files to avoid stating
+	// a convention is the worse trade for an archive; stating one silently is
+	// worse than either.
+	//
+	// The word "nine" is spelled out on purpose: byb-a20's pin scans this tree
+	// for a digit followed by "readable documents" and reads it as a claim
+	// about the CORPUS, which this is not.
+	defaulted := inh.MediaBox == nil
+	mb := inh.MediaBox
+	if defaulted {
+		mb = types.RectForDim(defaultPageWidthPt, defaultPageHeightPt)
+	}
+
+	// A form Do appends a scope each, so keeping them for the document grows
+	// with pages x draws. A Page's Scope is valid until the next Page call.
+	d.scopes = d.scopes[:0]
+	p = &Page{
+		Index:             n,
+		MediaBox:          rectOf(mb),
+		MediaBoxDefaulted: defaulted,
+		Rotate:            ((inh.Rotate % 360) + 360) % 360,
+		Scope:             d.addScope(inh.Resources, -1),
+	}
+	p.CropBox = p.MediaBox
+	if inh.CropBox != nil {
+		// ISO 32000-1 7.7.3.3: the CropBox is to be intersected with the
+		// MediaBox, not taken verbatim -- poppler does this too. An empty
+		// intersection (the two boxes don't overlap at all) falls back to
+		// the MediaBox rather than reporting a degenerate page.
+		if cb, ok := intersectRect(rectOf(inh.CropBox), p.MediaBox); ok {
+			p.CropBox = cb
+		}
+	}
+
+	// A page with no /Contents is legal and empty, and so is a page whose
+	// /Contents is there and resolves to zero bytes: an ordinary blank page,
+	// which is a duplex scan's back side, a section separator, or a form page
+	// left deliberately empty. pdfcpu reports both with model.ErrNoContent.
+	//
+	// Guarding on the presence of the KEY alone -- which is all this did before
+	// byb-cqs -- makes the second case an error and, because Inspect walks every
+	// page, fails the WHOLE document over one page that contains nothing.
+	// byb-uxb measured that against poppler over 200 govdocs1 files: six of the
+	// seven disagreements were this, 3% of the sample lost outright.
+	c, recovered, err := d.pageContents(pd)
+	if err != nil {
+		if le := pdfcpuLimit(d.lim, err); le != nil {
+			return nil, le
+		}
+		return nil, fmt.Errorf("byblos/pdfdoc: page %d content: %w", n, err)
+	}
+	p.Content, p.ContentRecovered = c, recovered
+	return p, nil
+}
+
+// pageContents decodes a page's content streams, and is the ONE place that
+// decides what a page's bytes are. Page, AppendContent and contentDepth all
+// route through it.
+//
+// It replaces a direct xt.PageContent call, which byblos can no longer use, for
+// a reason byb-3iw measured over every page of 4,840 documents. Under the
+// relaxed validation mode Open uses, pdfcpu's decodeContentStream SWALLOWS a
+// flate failure: the stream contributes zero bytes and the page is reported as
+// fine. When /Contents is a single stream that is model.ErrNoContent, which
+// byblos used to re-decode separately to tell a blank page from a shredded one.
+// But when /Contents is an ARRAY and a sibling element decodes, the sum is
+// non-zero, PageContent returns success, and the damaged element is dropped in
+// silence. That is the corpus's 150277 p25 (5,452 bytes -> its last 469, -91.4%)
+// and it is invisible from outside pdfcpu, so the decode has to happen here.
+//
+// recovered reports that at least one stream failed its integrity check and
+// byblos kept the bytes that decoded anyway. It does NOT mean bytes were lost:
+// a corrupted Adler-32 trailer alone still yields the complete stream, because
+// zlib raises ErrChecksum only after the final deflate block is consumed. What
+// it means is that the content does not match what the file attests, which is
+// what a caller needs to know either way. Page states it; see ContentRecovered.
+//
+// The elements are concatenated with NO separator between them, which is what
+// pdfcpu does (model/xreftable.go, the types.Array case is a bare
+// append(bb, o.Content...)) and what every other reader does -- straighten.go
+// records the same fact for the write side. Inserting a newline here would be
+// invisible to the suite and would change the content bytes of every clean
+// multi-element page in the corpus.
+func (d *doc) pageContents(pd types.Dict) (content []byte, recovered bool, err error) {
+	// A new page: the running total of decoded non-image streams starts over.
+	d.pageBytes, d.pageForms = 0, nil
+	if _, ok := pd.Find("Contents"); !ok {
+		return nil, false, nil
+	}
+	xt := d.ctx.XRefTable
+	o, err := xt.Dereference(pd["Contents"])
+	if err != nil {
+		return nil, false, err
+	}
+
+	// /Contents may be an indirect reference to an object that does not exist, or
+	// to a null. ISO 32000-1 7.3.10 makes a reference to a nonexistent object
+	// null, and 7.3.9 makes null equivalent to omitting the entry, so this is a
+	// legally blank page and not an error. pdfcpu v0.13's PageContent had exactly
+	// this arm; measured, dropping it refused two shapes v0.13 read as blank.
+	if o == nil {
+		return nil, false, nil
+	}
+
+	// /Contents is one stream or an array of them (ISO 32000-1 table 30).
+	objs := types.Array{o}
+	if arr, ok := o.(types.Array); ok {
+		objs = arr
+	} else if _, ok := o.(types.StreamDict); !ok {
+		return nil, false, errors.New("page content must be stream dict or array")
+	}
+
+	var buf bytes.Buffer
+	var dropped int
+	for _, obj := range objs {
+		if obj == nil {
+			continue
+		}
+		sd, err := xt.Dereference(obj)
+		if err != nil {
+			return nil, false, err
+		}
+		// A null entry, or an element that is not a stream at all. pdfcpu skips
+		// both rather than failing the page, and so does this.
+		s, ok := sd.(types.StreamDict)
+		if !ok {
+			continue
+		}
+		if err := d.decode(&s, true); err != nil {
+			// A cap or budget refusal is the document's, not damage in one element.
+			if isLimit(err) {
+				return nil, recovered, err
+			}
+			// A DAMAGED ELEMENT MUST NOT FAIL THE WHOLE PAGE. That is what v0.13
+			// did, in relaxed mode, and a version bump is not licence to lose a
+			// page byblos used to read: measured, refusing here dropped a healthy
+			// sibling's 39 bytes and broke AppendContent on documents v0.13
+			// stamped fine.
+			//
+			// Two shapes, two answers. A stream whose deflate data is INTACT and
+			// whose Adler-32 trailer is not decodes correctly once the trailer is
+			// repaired. A stream whose deflate data is itself corrupt has no
+			// trailer worth repairing, so it is DROPPED, which is again what
+			// v0.13's relaxed mode did.
+			// A DECODE LIMIT is not damage and must not start a recovery. pdfcpu
+			// refuses output past filter.DefaultMaxDecodeBytes (512 MiB) and no
+			// repair can make a stream smaller, so walking it again would inflate
+			// the same bomb a second time to reach the same conclusion. Checking
+			// here rather than only inside decodeRecovering is what keeps a
+			// malicious document to ONE capped decode, which is what main costs:
+			// measured on a 600 MiB zlib bomb with a corrupt trailer, TotalAlloc
+			// was 6,145 MiB before either guard, 4,096 with only the inner one, and
+			// ~2,048 with this.
+			if errors.Is(err, filter.ErrDecodeLimitExceeded) {
+				dropped++
+				recovered = true
+				continue
+			}
+			if repaired, ok := d.decodeRecovering(s); ok {
+				buf.Write(repaired)
+			} else {
+				dropped++
+			}
+			recovered = true
+			continue
+		}
+		buf.Write(s.Content)
+	}
+	switch {
+	case buf.Len() > 0:
+		return buf.Bytes(), recovered, nil
+	case dropped > 0:
+		// Every element was unreadable, so this page is SHREDDED, not blank, and
+		// byblos refuses it exactly as it did before. Telling the two apart is
+		// the whole reason this function exists: pdfcpu reports both with the
+		// identical model.ErrNoContent and the identical zero bytes.
+		return nil, recovered, fmt.Errorf("content stream decode: %d of %d streams unreadable",
+			dropped, len(objs))
+	default:
+		// A legal blank page: a duplex scan's back side, a section separator, a
+		// form page left deliberately empty.
+		//
+		// `recovered` is returned rather than a literal false: a page whose only
+		// stream failed its integrity check AND inflated to zero bytes did have a
+		// recovery, and reporting it as an ordinary blank page contradicts what
+		// ContentRecovered documents. It is normally false here.
+		return nil, recovered, nil
+	}
+}
+
+// decodeRecovering decodes s ONE FILTER AT A TIME, repairing a flate layer's
+// Adler-32 trailer when that is the only thing wrong with it.
+//
+// One filter at a time is the whole point, and it is what six successive
+// regressions converged on. pdfcpu v0.13 recovered these streams by nilling the
+// checksum error inside filter/flateDecode.go's passThru -- which runs on EVERY
+// FILTER APPLICATION, so a pipeline with two damaged flate layers had both
+// recovered. v0.15 propagates the error instead and types/streamdict.go then
+// DISCARDS the bytes it was handed.
+//
+// Earlier attempts here repaired ONE layer and asked pdfcpu to decode the rest of
+// the pipeline in one call. Each attempt was refuted by a shape it could not
+// express: first a filter CHAIN, where the flate layer is not the outermost and
+// Raw is not a zlib stream at all; then a chain whose SECOND flate layer was the
+// damaged one; then a chain with BOTH flate layers damaged, where every
+// single-layer repair is defeated by the other layer's damage and the element was
+// dropped -- v0.13 read 46 bytes and byblos refused the page, or beside a healthy
+// sibling returned 46 of 92 bytes silently.
+//
+// Walking the pipeline removes the guess. Each filter is applied on its own, so a
+// damaged flate layer is repaired at the point it is reached, N of them are
+// repaired independently, and pdfcpu still applies every filter and every
+// /DecodeParms predictor itself. Nothing here reimplements a PDF filter, which was
+// the mistake behind handing callers half-decoded bytes.
+//
+// ok is false when some layer cannot be decoded even after a repair, and its
+// element is then DROPPED rather than failing the page -- see pageContents.
+func (d *doc) decodeRecovering(s types.StreamDict) ([]byte, bool) {
+	max := min(d.lim.StreamBytes(), d.lim.PageStreamBytes()-d.pageBytes)
+	if max <= 0 {
+		return nil, false
+	}
+	data := s.Raw
+	for _, f := range s.FilterPipeline {
+		// One filter, over the bytes the previous one produced. DecodeParms travels
+		// with the filter, so a predictor is applied by pdfcpu on the layer that
+		// declares it.
+		step := s
+		step.Raw = data
+		step.FilterPipeline = []types.PDFFilter{f}
+		step.Content = nil
+		err := step.DecodeWithLimit(max)
+		if err == nil {
+			data = step.Content
+			continue
+		}
+		// Only a flate layer can be repaired; any other filter failing is a drop.
+		if f.Name != filter.Flate {
+			return nil, false
+		}
+		// A DECODE LIMIT is not a damaged checksum, and attempting a repair on one
+		// is both pointless and expensive. pdfcpu refuses output past
+		// filter.DefaultMaxDecodeBytes (512 MiB); repairing the trailer cannot make
+		// the stream smaller, so the retry below would inflate the same bomb a
+		// second time and hit the same cap. Measured on a 600 MiB zlib bomb with a
+		// corrupt trailer: attempting the repair took TotalAlloc to 6,145 MiB
+		// against roughly a third of that for a single capped decode.
+		if errors.Is(err, filter.ErrDecodeLimitExceeded) {
+			return nil, false
+		}
+		repaired, ok := repairTrailer(data)
+		if !ok {
+			return nil, false
+		}
+		step.Raw = repaired
+		step.Content = nil
+		if err := step.DecodeWithLimit(max); err != nil {
+			return nil, false
+		}
+		data = step.Content
+	}
+	return data, true
+}
+
+// repairTrailer returns zstream with its Adler-32 trailer replaced by the one its
+// deflate data implies, and everything past the trailer removed.
+//
+// ok is false when the deflate data does not inflate -- that stream is damaged
+// under the trailer and there is nothing here to repair -- or when it is not a
+// zlib stream this can rebuild.
+func repairTrailer(zstream []byte) ([]byte, bool) {
+	// A zlib stream is a 2-byte header, the deflate data, and a 4-byte Adler-32 of
+	// the UNCOMPRESSED bytes (RFC 1950). FDICT, header bit 5, prepends a dictionary
+	// id this does not handle; PDF producers do not set it.
+	const zlibHeader, adlerLen = 2, 4
+	if len(zstream) < zlibHeader+adlerLen || zstream[1]&0x20 != 0 {
+		return nil, false
+	}
+
+	// THE TRAILER IS NOT NECESSARILY THE LAST FOUR BYTES, and assuming it was is how
+	// an earlier version of this got refuted. A /Length that over-declares --
+	// routinely, by swallowing the EOL before `endstream` -- leaves those extra bytes
+	// in Raw, and pdfcpu's relaxed mode repairs a SHORT /Length but not a long one.
+	// Patching at len-4 then wrote the correct checksum to the wrong offsets: a lone
+	// stream became a refused page where v0.13 read 39 bytes, and an array silently
+	// lost half its content.
+	//
+	// So the end of the deflate data is FOUND, not assumed. bytes.Reader implements
+	// io.ByteReader, which is the condition under which compress/flate promises not
+	// to read further than it needs, so whatever the reader has left after the last
+	// deflate block begins with the real trailer.
+	rest := bytes.NewReader(zstream[zlibHeader:])
+	// Inflating directly skips the checksum entirely rather than ignoring a failure
+	// reported after the fact. Data that is ITSELF corrupt fails here -- that is what
+	// rejects corpus.CorruptContentStreamPayload, whose reserved deflate block type
+	// yields flate.CorruptInputError. A stream that inflates to ZERO bytes without
+	// error is NOT rejected: it is a legally empty content stream carrying a bad
+	// checksum, and refusing it would report a blank page as shredded.
+	//
+	// This early return is REDUNDANT and kept for legibility: the caller's Decode
+	// refuses the same streams, because repairing a trailer does not repair the data
+	// under it. Mutating it away changes no test outcome, which is stated here rather
+	// than left for the next reader to find.
+	//
+	// THE INFLATED BYTES ARE NEVER HELD. Only their Adler-32 is wanted, so they are
+	// streamed through the hash. io.ReadAll here would allocate the whole inflated
+	// size, and this path is reached on a DECODE FAILURE -- including pdfcpu's own
+	// filter.ErrDecodeLimitExceeded -- so it would bypass the 512 MiB cap
+	// (filter.DefaultMaxDecodeBytes) that pdfcpu enforces and byblos relies on.
+	// Measured before this was streamed: a 2 GiB zlib bomb with a corrupt trailer
+	// took TotalAlloc from main's flat 2,052 MiB to 10,550 MiB, growing with the
+	// bomb rather than being capped.
+	sum32 := adler32.New()
+	if _, err := io.Copy(sum32, flate.NewReader(rest)); err != nil {
+		return nil, false
+	}
+	end := len(zstream) - rest.Len() // first byte past the deflate data
+	if rest.Len() < adlerLen {
+		// THIS GUARD IS REACHED, and it is the difference between dropping an element
+		// and crashing. Do not delete it.
+		//
+		// An earlier comment here called it unreachable, reasoning that pdfcpu decodes
+		// a truncated trailer without error. That is true only of the passThru path.
+		// WITH a /Predictor, pdfcpu uses decodePostProcessRows instead, which returns
+		// io.ErrUnexpectedEOF unswallowed when the final row is PARTIAL -- so a
+		// predictor stream whose last row is short and whose trailer is cut to 1-3
+		// bytes arrives here. Measured: with this guard disabled that document panics
+		// with "slice bounds out of range [:83] with capacity 81"; with it, the element
+		// is dropped and a healthy sibling still reads, where v0.13 refused the page.
+		// TestPartialPredictorRowCutTrailerDropsTheElement covers it.
+		return nil, false
+	}
+
+	// Anything past the trailer is not part of the zlib stream and is dropped with
+	// it, so the repaired stream is exactly header + data + checksum.
+	raw := make([]byte, end+adlerLen)
+	copy(raw, zstream[:end+adlerLen])
+	sum := sum32.Sum32()
+	// RFC 1950 stores the Adler-32 most significant byte first.
+	raw[end] = byte(sum >> 24)
+	raw[end+1] = byte(sum >> 16)
+	raw[end+2] = byte(sum >> 8)
+	raw[end+3] = byte(sum)
+	return raw, true
+}
+
+// addScope appends a resource scope and returns its handle.
+//
+// Scopes live for one page: Page resets them. Resolving the same form
+// twice on a page appends duplicate entries, bounded by the walk's form cap.
+func (d *doc) addScope(res types.Dict, parent int) int {
+	d.scopes = append(d.scopes, scope{res: res, parent: parent})
+	return len(d.scopes) - 1
+}
+
+func (d *doc) XObject(sc int, name string) (content.XObject, bool) {
+	obj, ok := d.lookupResource(sc, "XObject", name)
+	if !ok {
+		return content.XObject{}, false
+	}
+	id := d.identify(obj)
+	sd, _, err := d.ctx.XRefTable.DereferenceStreamDict(obj)
+	if err != nil || sd == nil {
+		return content.XObject{}, false
+	}
+	sub := sd.Dict.Subtype()
+	if sub == nil {
+		return content.XObject{}, false
+	}
+
+	switch *sub {
+	case "Image":
+		csName := ""
+		if raw, ok := sd.Dict.Find("ColorSpace"); ok {
+			if n, ok := raw.(types.Name); ok {
+				csName = string(n)
+			}
+		}
+		d.images[id] = ImageInfo{
+			Name:        name,
+			ObjNr:       id,
+			Width:       d.intEntry(sd.Dict, "Width"),
+			Height:      d.intEntry(sd.Dict, "Height"),
+			BPC:         d.intEntry(sd.Dict, "BitsPerComponent"),
+			ImageMask:   d.boolEntry(sd.Dict, "ImageMask"),
+			SMask:       hasEntry(sd.Dict, "SMask"),
+			Mask:        hasEntry(sd.Dict, "Mask"),
+			Decode:      hasEntry(sd.Dict, "Decode"),
+			DecodeArray: d.numberArray(sd.Dict, "Decode"),
+			Filter:      d.filterName(sd.Dict),
+			ColorSpace:  csName,
+		}
+		// Keep the stream dictionary. RawImage renders from this rather than
+		// asking pdfcpu which objects a page uses, because that answer comes
+		// from the optimize pass, which deduplicates identical rasters.
+		d.streams[id] = sd
+		// And its xref identity, which ReplaceImage needs to write the
+		// substituted stream back: sd is a copy, not a handle (see write.go).
+		if r, ok := indirectRefOf(obj); ok {
+			d.refs[id] = r
+		}
+		return content.XObject{Image: true, ID: id}, true
+
+	case "Form":
+		// A form invoked many times on a page is decoded once and counts once;
+		// every Do shares that buffer, so a form that draws itself holds one
+		// decode, not one per nesting level.
+		if c, ok := d.pageForms[id]; ok && id >= 0 {
+			sd.Content = c
+		} else {
+			if err := d.decode(sd, true); err != nil {
+				if isLimit(err) && d.limitErr == nil {
+					d.limitErr = err
+				}
+				return content.XObject{}, false
+			}
+			if id >= 0 {
+				if d.pageForms == nil {
+					d.pageForms = map[int][]byte{}
+				}
+				d.pageForms[id] = sd.Content
+			}
+		}
+		m := content.Identity
+		if arr := d.arrayEntry(sd.Dict, "Matrix"); len(arr) == 6 {
+			for i := 0; i < 6; i++ {
+				v, ok := d.number(arr[i])
+				if !ok {
+					m = content.Identity
+					break
+				}
+				m[i] = v
+			}
+		}
+		var bbox *content.Box
+		if arr := d.arrayEntry(sd.Dict, "BBox"); len(arr) == 4 {
+			var vals [4]float64
+			ok := true
+			for i := 0; i < 4; i++ {
+				v, vok := d.number(arr[i])
+				if !vok {
+					ok = false
+					break
+				}
+				vals[i] = v
+			}
+			if ok {
+				bbox = &content.Box{LLX: vals[0], LLY: vals[1], URX: vals[2], URY: vals[3]}
+			}
+		}
+		// A form without its own /Resources inherits the enclosing resource
+		// dictionary (ISO 32000-1 section 8.10.2), which the scope's parent
+		// chain provides.
+		formScope := d.addScope(d.dictEntry(sd.Dict, "Resources"), sc)
+		return content.XObject{Content: sd.Content, Matrix: m, Scope: formScope, BBox: bbox}, true
+	}
+	return content.XObject{}, false
+}
+
+// lookupResource walks the scope chain so a form that declares only /Font still
+// resolves images through its parent. category is a resource dictionary key:
+// "XObject", "ExtGState".
+func (d *doc) lookupResource(sc int, category, name string) (types.Object, bool) {
+	for i := sc; i >= 0 && i < len(d.scopes); {
+		res := d.scopes[i].res
+		if res != nil {
+			if cat, err := d.ctx.XRefTable.DereferenceDict(res[category]); err == nil && cat != nil {
+				if o, ok := cat.Find(name); ok {
+					return o, true
+				}
+			}
+		}
+		i = d.scopes[i].parent
+		if i < 0 {
+			break
+		}
+	}
+	return nil, false
+}
+
+// ExtGStateOpaque reports whether the named graphics state leaves painting
+// fully opaque.
+//
+// A name that does not resolve, or a value that is not a dictionary, is
+// reported as not opaque. That is the direction that costs a divert rather than
+// a wrong document: the caller uses this to decide whether an image hides what
+// is painted beneath it.
+func (d *doc) ExtGStateOpaque(sc int, name string) bool {
+	obj, ok := d.lookupResource(sc, "ExtGState", name)
+	if !ok {
+		return false
+	}
+	gs, ok := d.deref(obj).(types.Dict)
+	if !ok {
+		return false
+	}
+	// /ca is the non-stroking alpha and /CA the stroking one. An image is
+	// painted with /ca, but a state that sets either is not one to reason about
+	// occlusion from.
+	for _, key := range []string{"ca", "CA"} {
+		if v, ok := d.number(gs[key]); ok && v < 1 {
+			return false
+		}
+	}
+	// /SMask /None is how a graphics state says it has no soft mask. Anything
+	// else is a mask, and reading it would mean rendering it.
+	if sm, ok := gs.Find("SMask"); ok {
+		if n, isName := d.deref(sm).(types.Name); !isName || n.Value() != "None" {
+			return false
+		}
+	}
+	return true
+}
+
+// Font resolves the named /Font resource to a stable id, the font half of
+// content.Env. The id is the font dict's object number when the resource is an
+// indirect reference, and a synthetic negative one otherwise — fresh per call,
+// exactly like the XObject path above. Every /Font in the corpus is indirect,
+// so the direct-dict case is unexercised; if a real archive ever shows direct
+// font dicts, that call site is where a per-(scope, name) cache would go, so
+// repeated Tf ops naming the same dict agree.
+func (d *doc) Font(sc int, name string) (int, bool) {
+	obj, ok := d.lookupResource(sc, "Font", name)
+	if !ok {
+		return 0, false
+	}
+	return d.identify(obj), true
+}
+
+// RenderFont is the renderer's view of one simple font dict: the fields
+// internal/render's Font seam carries. Program is the decoded /FontFile,
+// /FontFile2 or /FontFile3 stream, nil when the dict embeds none -- which is
+// the case stage 4f substitutes for. Type0/W/DW mirror render.Font's fields
+// of the same name (byb-6z1): a composite /Subtype /Type0 font's Program and
+// widths live on its descendant CIDFont, not the Type0 dict itself.
+type RenderFont struct {
+	BaseFont  string
+	Flags     int // /FontDescriptor /Flags
+	FirstChar int
+	Widths    []float64
+	Program   []byte
+	Type0     bool
+	W         map[uint16]float64
+	DW        float64
+}
+
+// maxCIDWidthEntries bounds how many CID->width entries a /W array can
+// flatten to. render.Font.W keys are uint16 CIDs, so 65536 (the whole CID
+// space) is already generous. Without a bound the range form (ISO 32000-1
+// 9.7.4.3) `cFirst cLast w` lets ~20 bytes of input -- /W [0 2147483647 500]
+// -- claim 2^31 map entries (byb-6z1, bug class 5: unbounded preallocation
+// from a declared count).
+const maxCIDWidthEntries = 65536
+
+// RenderFont resolves the named /Font resource for rendering. A composite
+// /Subtype /Type0 font (byb-6z1) is resolved through its descendant CIDFont
+// when /Encoding is Identity-H, per render.Font's own contract (text.go)
+// that only the Identity CMaps give code boundaries without decoding an
+// embedded or predefined CMap. Any other /Encoding -- a CMap stream, a
+// predefined CJK CMap name, or Identity-V -- returns ok=false rather than a
+// wrong or fallback resolution. Identity-V is refused, not resolved with
+// horizontal metrics: showText has no vertical mode, so it would ink glyphs
+// where poppler inks none, and a census of all 5,672 pinned-sample documents
+// finds 0 Identity-V among 4,482 Type0 dicts (byb-6z1) -- worth revisiting
+// only alongside actual vertical-layout support, on a corpus that has some.
+// See Font.Type0 in text.go.
+func (d *doc) RenderFont(sc int, name string) (RenderFont, bool) {
+	// Memoized by the font dict's object identity, not by (scope, name): a
+	// resource dict aliasing one dict under many Tf names (byb-rq3's shape)
+	// would otherwise re-run sd.DecodeWithLimit's full read-to-the-limit on
+	// EVERY name, including a rejected /FontFile whose Program comes back
+	// empty -- render.resolveFont's own budget charges 0 bytes for that
+	// result, so nothing on the caller side bounds the repeat. Keyed by
+	// object number (identify's synthetic ids are never reused, so a direct
+	// dict -- unexercised in the corpus per the Font method's comment --
+	// just never hits).
+	obj, ok := d.lookupResource(sc, "Font", name)
+	if !ok {
+		return RenderFont{}, false
+	}
+	id := d.identify(obj)
+	if id >= 0 {
+		if c, hit := d.fontCache[id]; hit {
+			return c.rf, c.ok
+		}
+	}
+	rf, err := d.renderFont(sc, name)
+	entry := fontCacheEntry{rf: rf, ok: err == nil}
+	if id >= 0 {
+		if d.fontCache == nil {
+			d.fontCache = map[int]fontCacheEntry{}
+		}
+		d.fontCache[id] = entry
+	}
+	return entry.rf, entry.ok
+}
+
+// fontCacheEntry is one memoized RenderFont result, keyed by font dict
+// object number in doc.fontCache.
+type fontCacheEntry struct {
+	rf RenderFont
+	ok bool
+}
+
+func (d *doc) renderFont(sc int, name string) (rf RenderFont, err error) {
+	// The same shape as RawImageGlobals: this dereferences arbitrary objects
+	// a font dict names and runs pdfcpu's filter chain over one of them, so a
+	// corrupt dict must divert this font, not take the page down.
+	defer catchPanic(fmt.Sprintf("resolving font %q", name), &err)
+	obj, ok := d.lookupResource(sc, "Font", name)
+	if !ok {
+		return rf, fmt.Errorf("byblos/pdfdoc: no /Font resource %q", name)
+	}
+	dict, ok := d.deref(obj).(types.Dict)
+	if !ok {
+		return rf, fmt.Errorf("byblos/pdfdoc: /Font %q is not a dict", name)
+	}
+	// widthDict is where /FirstChar, /Widths and /FontDescriptor are read
+	// from: the font dict itself, unless it is a Type0 composite, in which
+	// case those live on its one descendant CIDFont (ISO 32000-1 9.7.4).
+	widthDict := dict
+	if st := dict.NameEntry("Subtype"); st != nil && *st == "Type0" {
+		enc, isName := d.deref(dict["Encoding"]).(types.Name)
+		if !isName || enc.Value() != "Identity-H" {
+			return rf, fmt.Errorf("byblos/pdfdoc: /Font %q Type0 /Encoding is not Identity-H", name)
+		}
+		descFonts := d.arrayEntry(dict, "DescendantFonts")
+		if len(descFonts) != 1 {
+			return rf, fmt.Errorf("byblos/pdfdoc: /Font %q /DescendantFonts is not one element", name)
+		}
+		desc, isDict := d.deref(descFonts[0]).(types.Dict)
+		if !isDict {
+			return rf, fmt.Errorf("byblos/pdfdoc: /Font %q descendant is not a dict", name)
+		}
+		rf.Type0 = true
+		rf.DW = 1000 // ISO 32000-1 9.7.4.3 default, overwritten below only if /DW parses as a number.
+		if n, ok := d.number(desc["DW"]); ok {
+			rf.DW = n
+		}
+		rf.W = d.cidWidths(desc)
+		widthDict = desc
+	}
+	if bf := dict.NameEntry("BaseFont"); bf != nil {
+		rf.BaseFont = *bf
+	}
+	if !rf.Type0 {
+		rf.FirstChar = d.intEntry(dict, "FirstChar")
+		rf.Widths = d.numberArray(dict, "Widths")
+	}
+	fd := d.dictEntry(widthDict, "FontDescriptor")
+	if fd == nil {
+		return rf, nil
+	}
+	rf.Flags = d.intEntry(fd, "Flags")
+	for _, key := range []string{"FontFile2", "FontFile3", "FontFile"} {
+		o, found := fd.Find(key)
+		if !found {
+			continue
+		}
+		sd, _, err := d.ctx.XRefTable.DereferenceStreamDict(o)
+		if err != nil || sd == nil {
+			continue
+		}
+		if err := sd.DecodeWithLimit(d.lim.FontProgramBytes()); err != nil {
+			continue
+		}
+		if int64(len(sd.Content)) > d.lim.FontProgramBytes() {
+			// DecodeWithLimit only consults maxDecodeBytes inside a filter
+			// stage: an unfiltered stream (no /Filter, or a preserved image
+			// filter) returns sd.Raw untouched (types.StreamDict.
+			// DecodeLengthWithLimit), so a literal oversized program must be
+			// bounded here too -- see limits.DefaultFontProgramBytes.
+			continue
+		}
+		rf.Program = sd.Content
+		break
+	}
+	return rf, nil
+}
+
+// identify returns a stable id for an XObject: its PDF object number when it is
+// an indirect reference, and a negative synthetic id otherwise.
+func (d *doc) identify(o types.Object) int {
+	if r, ok := indirectRefOf(o); ok {
+		return r.ObjectNumber.Value()
+	}
+	id := d.nextID
+	d.nextID--
+	return id
+}
+
+// indirectRefOf reports the indirect reference o is, if it is one. pdfcpu
+// yields both the value and the pointer form depending on the parse path.
+func indirectRefOf(o types.Object) (types.IndirectRef, bool) {
+	switch v := o.(type) {
+	case types.IndirectRef:
+		return v, true
+	case *types.IndirectRef:
+		return *v, true
+	}
+	return types.IndirectRef{}, false
+}
+
+func (d *doc) ImageInfo(id int) (ImageInfo, bool) {
+	info, ok := d.images[id]
+	return info, ok
+}
+
+// RawImage renders the image XObject that XObject previously resolved as id.
+//
+// It renders from the stream dictionary this document already holds, on the
+// already-parsed context. Two consequences worth stating, because the obvious
+// alternative (api.ExtractImagesRaw with a page number) gets both wrong:
+//
+//   - It is per-image, not per-file. ExtractImagesRaw runs
+//     ReadValidateAndOptimize on every call, so extracting an N-page document
+//     would re-read, re-validate and re-optimize it N times — and could reject
+//     on the validator that Open deliberately skipped.
+//   - It is per-object, not per-deduplicated-object. pdfcpu's optimize pass
+//     collapses byte-identical image XObjects, so the map ExtractImagesRaw
+//     returns for page 2 of a duplex scan is keyed by page 1's object number.
+//     See the dup-raster corpus document.
+func (d *doc) RawImage(ctx context.Context, id int) (data []byte, fileType string, err error) {
+	// The same shape as RawImageGlobals and renderFont below: this hands an
+	// arbitrary image dict to pdfcpu, which reads entries it does not check
+	// for. pdfcpu's pdfImage does `bpc := *sd.IntEntry("BitsPerComponent")`
+	// (writeImage.go:151), so an image XObject with no /BitsPerComponent
+	// nil-dereferences inside the library rather than returning an error --
+	// nothing byblos can see coming, so it has to be recovered. A corrupt
+	// image must divert or skip, not take the process down (byb-11r).
+	//
+	// THIS WAS THE ONLY pdfcpu SEAM IN THIS FILE WITHOUT THE GUARD, and it
+	// stayed latent because the extract path diverts most bad pages before
+	// reaching here. Rendering draws EVERY image XObject on the page, so
+	// byb-547's RenderPage made it live: govdocs1/400566.pdf p1 crashed
+	// outright, 1 file in the 5,672-file pinned sample.
+	defer catchPanic(fmt.Sprintf("rendering image %d", id), &err)
+	sd, ok := d.streams[id]
+	if !ok {
+		return nil, "", fmt.Errorf("byblos/pdfdoc: image %d has not been resolved on this document", id)
+	}
+	// The image's own header bounds its decode: pixels first, then pdfcpu's
+	// per-stream decode limit set to the declared decoded size (experiment 4:
+	// pdfcpu applies Conf.Limits.MaxDecodeBytes, 512 MiB by default, to image
+	// streams and byblos has no decoder of its own for them).
+	info := d.images[id]
+	// A forged header must not reach pdfcpu: it reads a limit of 0 as its 512 MiB
+	// default and a negative one as no limit.
+	if info.Width <= 0 || info.Height <= 0 {
+		return nil, "", fmt.Errorf("byblos/pdfdoc: image %d: invalid dimensions %d x %d", id, info.Width, info.Height)
+	}
+	if err := limits.Check("image-pixels", int64(info.Width)*int64(info.Height), d.lim.ImagePixels()); err != nil {
+		return nil, "", err
+	}
+	last := lastFilter(sd)
+	bpc, n := info.BPC, 4 // four components when the colour space does not say
+	if info.ImageMask {
+		bpc, n = 1, 1
+	} else if last == filter.CCITTFax {
+		n = 1
+	} else if c, err := pdfcpu.ColorSpaceComponents(d.ctx.XRefTable, sd); err == nil && c > 0 {
+		n = c
+		if a := d.indexed(sd); a != nil { // pdfcpu counts the base space; a sample is one index
+			n = 1
+			// The lookup table is a stream pdfcpu inflates when it paints: 256
+			// entries of the base space is all there is.
+			if lut, _, err := d.ctx.XRefTable.DereferenceStreamDict(a[3]); err == nil && lut != nil {
+				if err := lut.DecodeWithLimit(int64(256 * c)); err != nil {
+					if errors.Is(err, filter.ErrDecodeLimitExceeded) {
+						return nil, "", &limits.LimitError{Name: "image-bytes", Got: int64(256*c) + 1, Max: int64(256 * c)}
+					}
+					return nil, "", fmt.Errorf("byblos/pdfdoc: image %d: lookup table: %w", id, err)
+				}
+			}
+		}
+	}
+	declared := imageDecodeBytes(info.Width, info.Height, bpc, n, len(sd.FilterPipeline))
+	// The bound is on pixels. When the last filter is a codec, the layers in
+	// front of it (Flate around DCT) yield compressed bytes, which for a tiny
+	// image outweigh its pixels, so they get a floor.
+	codec := last == "DCTDecode" || last == "JPXDecode" || last == "JBIG2Decode"
+	if codec {
+		declared = max(declared, 1<<20)
+	}
+	if declared <= 0 { // overflow
+		return nil, "", &limits.LimitError{Name: "image-bytes", Got: d.lim.StreamBytes() + 1, Max: d.lim.StreamBytes()}
+	}
+	// pdfcpu decodes everything but a codec's stream itself, and not under any
+	// budget of its own: take its memory from byblos's, before it allocates. Its
+	// decode buffer grows by doubling and is copied (DecodeBytes), and the
+	// raster it renders is 4 bytes a pixel. The PNG it encodes it to and the copy
+	// RawImage reads out of it are each as big as the decoded size or the
+	// raster's 4 bytes a pixel (gray and indexed render as RGB, or RGBA with a
+	// mask), whichever is more, when the pixels do not compress, and a growing
+	// buffer holds its old and new arrays at once: three times, not two. A soft mask is decoded too, under the size its own dictionary
+	// allows, so a stream that lies about it is refused.
+	if !codec {
+		sm, smCap := d.softMask(sd, info)
+		px := limits.MulSat(int64(info.Width), int64(info.Height))
+		release, err := limits.Reserve(ctx, limits.DecodeBytes(declared)+3*max(declared, 4*px)+limits.DecodeBytes(smCap)+4*px)
+		if err != nil {
+			return nil, "", err
+		}
+		defer release()
+		if sm != nil {
+			if err := sm.DecodeWithLimit(smCap); errors.Is(err, filter.ErrDecodeLimitExceeded) {
+				return nil, "", &limits.LimitError{Name: "image-bytes", Got: smCap + 1, Max: smCap}
+			} else if err != nil {
+				return nil, "", fmt.Errorf("byblos/pdfdoc: image %d: soft mask: %w", id, err)
+			}
+		}
+	}
+	lims := &d.ctx.Configuration.Limits
+	saved := lims.MaxDecodeBytes
+	lims.MaxDecodeBytes = declared
+	defer func() { lims.MaxDecodeBytes = saved }()
+	release, err := d.reserveCMYKDCT(sd, info, declared)
+	if err != nil {
+		return nil, "", err
+	}
+	defer release()
+	im, err := pdfcpu.ExtractImage(context.Background(), d.ctx, sd, false, d.images[id].Name, id, false)
+	if err != nil {
+		if errors.Is(err, filter.ErrDecodeLimitExceeded) {
+			return nil, "", &limits.LimitError{Name: "image-bytes", Got: declared + 1, Max: declared}
+		}
+		return nil, "", fmt.Errorf("byblos/pdfdoc: rendering image %d: %w", id, err)
+	}
+	// pdfcpu signals "I will not render this filter" by returning a nil reader
+	// and an empty file type, with a nil error. Reading that panics.
+	if im == nil || im.Reader == nil || im.FileType == "" {
+		return nil, "", fmt.Errorf("byblos/pdfdoc: image %d: %w", id, ErrUnsupportedCodec)
+	}
+	b, err := io.ReadAll(im)
+	if err != nil {
+		return nil, "", fmt.Errorf("byblos/pdfdoc: reading image %d: %w", id, err)
+	}
+	return b, im.FileType, nil
+}
+
+// lastFilter is the name of sd's last filter, empty for none.
+func lastFilter(sd *types.StreamDict) string {
+	if n := len(sd.FilterPipeline); n > 0 {
+		return sd.FilterPipeline[n-1].Name
+	}
+	return ""
+}
+
+// indexed is sd's /ColorSpace array when it is an /Indexed one, else nil.
+func (d *doc) indexed(sd *types.StreamDict) types.Array {
+	a, _ := d.deref(sd.Dict["ColorSpace"]).(types.Array)
+	if len(a) < 4 {
+		return nil
+	}
+	if nm, _ := d.deref(a[0]).(types.Name); nm.Value() != "Indexed" {
+		return nil
+	}
+	return a
+}
+
+// softMask is image sd's /SMask stream and the decoded size its own dictionary
+// allows (8-bit gray unless it says otherwise); nil, 0 when there is none. A
+// mask of unusable size is held to the image's.
+func (d *doc) softMask(sd *types.StreamDict, info ImageInfo) (*types.StreamDict, int64) {
+	o, ok := sd.Dict.Find("SMask")
+	if !ok {
+		return nil, 0
+	}
+	sm, _, err := d.ctx.XRefTable.DereferenceStreamDict(o)
+	if err != nil || sm == nil {
+		return nil, 0
+	}
+	w, h := d.intEntry(sm.Dict, "Width"), d.intEntry(sm.Dict, "Height")
+	if w <= 0 || h <= 0 {
+		w, h = info.Width, info.Height
+	}
+	c := imageDecodeBytes(w, h, d.intEntry(sm.Dict, "BitsPerComponent"), 1, len(sm.FilterPipeline))
+	if l := lastFilter(sm); l == filter.DCT || l == filter.JPX || l == filter.JBIG2 { // the stages in front hold the codec's bytes
+		c = max(c, 1<<20)
+	}
+	return sm, c
+}
+
+// reserveCMYKDCT guards the one DCT decode pdfcpu makes itself: a four-component
+// stream is decoded with image/jpeg inside ExtractImage, before any caller sees
+// the bytes, so the SOF check and the memory reservation byblos gives every
+// other DCT decode happen here, on the encoded stream, first. A frame past the
+// pixel cap is a *limits.LimitError; one the dictionary does not allow is
+// ErrUnsupportedCodec. Anything else returns a no-op release. declared bounds
+// what pdfcpu holds after the decode (gob, then the RGBA it renders), so three
+// copies of it join the decode's own need in the reservation.
+func (d *doc) reserveCMYKDCT(sd *types.StreamDict, info ImageInfo, declared int64) (func(), error) {
+	none := func() {}
+	n := len(sd.FilterPipeline)
+	if n == 0 || sd.FilterPipeline[n-1].Name != filter.DCT {
+		return none, nil
+	}
+	if comps, err := pdfcpu.ColorSpaceComponents(d.ctx.XRefTable, sd); err != nil || comps != 4 {
+		return none, nil // ExtractImage reports the former; the latter is not decoded here
+	}
+	jpg := sd.Raw
+	if n > 1 { // the filters in front of DCT, run on a copy so sd is left as it was
+		cp := *sd
+		cp.FilterPipeline, cp.Content = sd.FilterPipeline[:n-1], nil
+		if err := cp.DecodeWithLimit(declared); err != nil {
+			return nil, fmt.Errorf("byblos/pdfdoc: image %d: %w", info.ObjNr, err)
+		}
+		jpg = cp.Content
+	}
+	_, release, err := dct.Reserve(context.Background(), jpg, d.lim.ImagePixels(), int64(info.Width)*int64(info.Height), 4, 3*declared)
+	if err != nil {
+		var le *limits.LimitError
+		if !errors.As(err, &le) && !errors.Is(err, limits.ErrMemoryLimit) {
+			err = fmt.Errorf("%w: %v", ErrUnsupportedCodec, err)
+		}
+		return nil, err
+	}
+	return release, nil
+}
+
+// RawImageGlobals returns the JBIG2 page-0 segments image id declares in
+// /DecodeParms /JBIG2Globals, decoded, or nil when it declares none.
+//
+// IT IS SEPARATE FROM RawImage BECAUSE THE TWO ARE DIFFERENT STREAMS, and PDF
+// gives them different lifetimes on purpose. The image stream is one page. The
+// globals stream is shared: a bulk scanner writes one symbol dictionary for a
+// whole document and every page's image dictionary points at it, so the same
+// bytes come back for hundreds of ids. Returning them concatenated with the
+// image would be wrong in both directions -- it would multiply the dictionary
+// by the page count, and it would put page-0 segments in front of a page-1
+// stream, which is not what ISO 32000-1:2008 7.4.7 describes.
+//
+// pdfcpu's ExtractImage is no help here. It renders the IMAGE, and for JBIG2 it
+// hands the stream back opaque (see RawImage), so /DecodeParms is never looked
+// at by anything upstream of this.
+//
+// ABSENCE IS NOT AN ERROR and unreadability is. A generic-region JBIG2 image
+// legitimately carries no globals -- byblos's own encoder writes none -- so nil
+// is the ordinary answer. A /JBIG2Globals entry that is present and does not
+// resolve to a stream is the opposite case: those segments are needed, and
+// decoding without them composes a text region against an empty symbol list and
+// yields a blank page rather than an error.
+func (d *doc) RawImageGlobals(id int) (globals []byte, err error) {
+	// The one path in this package that dereferences an arbitrary indirect
+	// object named by an image dictionary and then runs pdfcpu's filter chain
+	// over whatever it finds. That is the shape catchPanic exists for (see
+	// ErrMalformed): a corrupt /JBIG2Globals object would otherwise take the
+	// whole run down instead of diverting one page, which is the loss byb-avp
+	// fixed at the Page boundary.
+	defer catchPanic(fmt.Sprintf("reading /JBIG2Globals for image %d", id), &err)
+
+	sd, ok := d.streams[id]
+	if !ok {
+		return nil, fmt.Errorf("byblos/pdfdoc: image %d has not been resolved on this document", id)
+	}
+	parms := d.decodeParms(sd.Dict)
+	if parms == nil {
+		return nil, nil
+	}
+	obj, ok := parms.Find("JBIG2Globals")
+	if !ok {
+		return nil, nil
+	}
+	gsd, _, err := d.ctx.XRefTable.DereferenceStreamDict(obj)
+	if err != nil {
+		return nil, fmt.Errorf("byblos/pdfdoc: image %d: resolving /JBIG2Globals: %w", id, err)
+	}
+	if gsd == nil {
+		return nil, fmt.Errorf("byblos/pdfdoc: image %d: /JBIG2Globals does not resolve to a stream", id)
+	}
+	if err := d.decode(gsd, false); err != nil {
+		if isLimit(err) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("byblos/pdfdoc: image %d: decoding /JBIG2Globals: %w", id, err)
+	}
+	return gsd.Content, nil
+}
+
+// decodeParms returns the /DecodeParms dictionary that belongs to the LAST
+// entry of dict's /Filter -- the image codec, by the same argument filterName
+// makes for reading the last entry rather than the first.
+//
+// /DecodeParms is parallel to /Filter (ISO 32000-1:2008 7.4.1, table 5): a
+// dictionary when /Filter is a name, an array of the same length when /Filter
+// is an array, with a null in the slot of every filter that takes no
+// parameters. A lone dictionary against a filter array is out of specification
+// and files write it anyway; it is accepted here because there is only one
+// filter in the chain that takes parameters and only one dictionary offered, so
+// nothing is being guessed at.
+func (d *doc) decodeParms(dict types.Dict) types.Dict {
+	parms := d.deref(dict["DecodeParms"])
+	arr, isArray := parms.(types.Array)
+	if !isArray {
+		p, _ := parms.(types.Dict)
+		return p
+	}
+	// Index by the filter chain, so a two-filter image takes the second
+	// dictionary rather than the first.
+	i := len(arr) - 1
+	if f, ok := d.deref(dict["Filter"]).(types.Array); ok && len(f) <= len(arr) {
+		i = len(f) - 1
+	}
+	if i < 0 || i >= len(arr) {
+		return nil
+	}
+	p, _ := d.deref(arr[i]).(types.Dict)
+	return p
+}
+
+func (d *doc) number(o types.Object) (float64, bool) {
+	o, err := d.ctx.XRefTable.Dereference(o)
+	if err != nil {
+		return 0, false
+	}
+	switch v := o.(type) {
+	case types.Integer:
+		return float64(v.Value()), true
+	case types.Float:
+		return v.Value(), true
+	}
+	return 0, false
+}
+
+func rectOf(r *types.Rectangle) Rect {
+	return Rect{LLX: r.LL.X, LLY: r.LL.Y, URX: r.UR.X, URY: r.UR.Y}
+}
+
+// intersectRect returns the overlap of a and b, and false if they don't
+// overlap at all.
+func intersectRect(a, b Rect) (Rect, bool) {
+	r := Rect{
+		LLX: max(a.LLX, b.LLX),
+		LLY: max(a.LLY, b.LLY),
+		URX: min(a.URX, b.URX),
+		URY: min(a.URY, b.URY),
+	}
+	if r.LLX >= r.URX || r.LLY >= r.URY {
+		return Rect{}, false
+	}
+	return r, true
+}
+
+// --- dereferencing dictionary readers ---------------------------------------
+//
+// types.Dict's own IntEntry / BooleanEntry / DictEntry / ArrayEntry return the
+// zero value when the entry is an types.IndirectRef instead of a direct object.
+// An indirect /Resources on a Form XObject is common in real documents and an
+// indirect /Width is legal, and in both cases the failure would be silent wrong
+// data — an empty form scope, or Width 0 flowing into PageInfo — rather than an
+// error. These read through the reference.
+
+func (d *doc) deref(o types.Object) types.Object {
+	v, err := d.ctx.XRefTable.Dereference(o)
+	if err != nil {
+		return nil
+	}
+	return v
+}
+
+func (d *doc) intEntry(dict types.Dict, key string) int {
+	if v, ok := d.deref(dict[key]).(types.Integer); ok {
+		return v.Value()
+	}
+	return 0
+}
+
+func (d *doc) boolEntry(dict types.Dict, key string) bool {
+	if v, ok := d.deref(dict[key]).(types.Boolean); ok {
+		return v.Value()
+	}
+	return false
+}
+
+func (d *doc) dictEntry(dict types.Dict, key string) types.Dict {
+	if v, ok := d.deref(dict[key]).(types.Dict); ok {
+		return v
+	}
+	return nil
+}
+
+// hasEntry reports whether dict declares key at all. /SMask and /Mask are read
+// this way on purpose: an indirect reference, a stream and an array are all
+// "there is a mask", and dereferencing to learn which would say nothing more.
+func hasEntry(dict types.Dict, key string) bool {
+	_, ok := dict.Find(key)
+	return ok
+}
+
+// filterName reports the image codec dict declares; see ImageInfo.Filter for
+// why an array yields its last entry rather than its first.
+func (d *doc) filterName(dict types.Dict) string {
+	switch v := d.deref(dict["Filter"]).(type) {
+	case types.Name:
+		return string(v)
+	case types.Array:
+		if len(v) == 0 {
+			return ""
+		}
+		if n, ok := d.deref(v[len(v)-1]).(types.Name); ok {
+			return string(n)
+		}
+	}
+	return ""
+}
+
+// numberArray reads key as an array of numbers, and returns nil unless every
+// element is one. All-or-nothing on purpose: a partly-read array is a remap a
+// caller cannot apply, and returning it with holes in it invites applying it
+// anyway.
+//
+// An indirect array is converted once and every caller shares the result, which
+// must not be modified: pdfcpu parses the array once, but d.images and the
+// font records outlive the walk, and K images naming one M-entry array would
+// otherwise hold K*8*M bytes no account sees. A direct array belongs to one
+// dictionary the parse already counted.
+func (d *doc) numberArray(dict types.Dict, key string) []float64 {
+	arr := d.arrayEntry(dict, key)
+	if len(arr) == 0 {
+		return nil
+	}
+	if ref, ok := dict[key].(types.IndirectRef); ok {
+		if out, ok := d.numArrays[ref.ObjectNumber.Value()]; ok {
+			return out
+		}
+		out := d.readNumbers(arr)
+		if d.numArrays == nil {
+			d.numArrays = map[int][]float64{}
+		}
+		d.numArrays[ref.ObjectNumber.Value()] = out
+		return out
+	}
+	return d.readNumbers(arr)
+}
+
+func (d *doc) readNumbers(arr types.Array) []float64 {
+	out := make([]float64, len(arr))
+	for i, o := range arr {
+		v, ok := d.number(o)
+		if !ok {
+			return nil
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func (d *doc) arrayEntry(dict types.Dict, key string) types.Array {
+	if v, ok := d.deref(dict[key]).(types.Array); ok {
+		return v
+	}
+	return nil
+}
+
+// cidWidths flattens a descendant CIDFont's /W (ISO 32000-1 9.7.4.3) to
+// CID -> width. /W interleaves two forms in one array:
+//
+//	c [w1 w2 ... wn]   n consecutive CIDs starting at c
+//	cFirst cLast w     every CID in [cFirst, cLast] gets w
+//
+// A malformed head (a non-number where a CID is expected) stops the scan
+// rather than misreading the rest of the array as something it is not.
+//
+// budget, not len(out), is what bounds the work: both forms can target the
+// same CIDs repeatedly (a repeated range, or a shared indirect sub-array
+// referenced many times), and len(out) stops growing on a repeat while the
+// loop keeps re-walking every CID it names. Gating on len(out) alone lets
+// ~20 bytes of /W (a repeated `0 65534 500` triple, or one shared `9 0 R`
+// sub-array referenced N times) burn O(N*65536) time for O(1) input growth
+// (byb-6z1 review, bug class 6). budget is decremented once per CID visited,
+// by either form, so total work across the whole array is capped at
+// maxCIDWidthEntries regardless of how many times a range repeats.
+func (d *doc) cidWidths(dict types.Dict) map[uint16]float64 {
+	arr := d.arrayEntry(dict, "W")
+	if len(arr) == 0 {
+		return nil
+	}
+	out := map[uint16]float64{}
+	// budget bounds work, not entries covered, so it must accommodate both:
+	// maxCIDWidthEntries for the CIDs a single range/sub-array can visit,
+	// plus len(arr) so that entries after a full-space range (budget
+	// otherwise drained to 0) still get their turn to override it (byb-6z1
+	// review, correctness finding 1).
+	budget := maxCIDWidthEntries + len(arr)
+	for i := 0; i < len(arr) && budget > 0; {
+		c, ok := d.number(arr[i])
+		if !ok || c < 0 || c > 65535 {
+			break
+		}
+		i++
+		if i >= len(arr) {
+			break
+		}
+		if sub, isArray := d.deref(arr[i]).(types.Array); isArray {
+			cid := int(c)
+			for _, wo := range sub {
+				if cid > 65535 || budget <= 0 {
+					break
+				}
+				if w, ok := d.number(wo); ok {
+					out[uint16(cid)] = w
+				}
+				cid++
+				budget--
+			}
+			i++
+			continue
+		}
+		last, ok := d.number(arr[i])
+		if !ok {
+			break
+		}
+		i++
+		if i >= len(arr) {
+			break
+		}
+		w, ok := d.number(arr[i])
+		if !ok {
+			break
+		}
+		i++
+		// Clamp in float space, before converting to int: last can be a
+		// float wildly out of int range (e.g. 1e300), and Go's float64->int
+		// conversion of an out-of-range value is implementation-defined --
+		// arm64 saturates, amd64 wraps to a negative -- so converting first
+		// and clamping after gave a different rendered layout per
+		// architecture (byb-6z1 review finding 4).
+		if last > 65535 {
+			last = 65535
+		}
+		hi := int(last)
+		for cid := int(c); cid <= hi && budget > 0; cid++ {
+			out[uint16(cid)] = w
+			budget--
+		}
+	}
+	return out
+}

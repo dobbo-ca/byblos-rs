@@ -1,0 +1,197 @@
+BT
+/TT2 1 Tf
+9.0026 0 0 9.0026 297.66 805.4603 Tm
+/Cs6 cs 0 0 0 scn
+/GS1 gs
+0 Tc
+0 Tw
+( )Tj
+10.98 0 0 10.98 56.7 30.8603 Tm
+0.0027 Tc
+(42)Tj
+/TT4 1 Tf
+1 0 TD
+0.001 Tc
+0.0058 Tw
+[( )-2874.3(ITU-T Rec. T.4 )5.4(\(07/2)3.7(003)3.7(\) )]TJ
+12 0 0 12 56.7 774.0803 Tm
+0.0002 Tc
+-0.0008 Tw
+[(E.6.5 )-895.6(Definition of the APPn Markers Defined for continuous-tone G3FAX )]TJ
+/TT2 1 Tf
+12.0035 0 0 12.0035 56.7 754.4603 Tm
+0.0008 Tc
+0.0091 Tw
+[(The applica)4.8(t)3.7(ion code APP1 initia)4.8(tes identif)3.9(ica)4.8(tion)5.9( of the im)8.9(age as a G3FAX applicatio)5.9(n and def)3.9(i)-1.3(nes )]TJ
+0 -1.1497 TD
+0 Tc
+0.1952 Tw
+[(the spatial resolution and subsam)8.1(pling. This marker directly follows the SOI m)8.1(a)-1(rker. The data )]TJ
+T*
+0.0014 Tc
+-0.0027 Tw
+[(f)4.5(o)1.5(rm)9.5(at will be as f)4.5(o)1.5(llows: )]TJ
+0 -1.6495 TD
+0.0001 Tc
+-0.0002 Tw
+[(X'FFE1')5.3( \(APP1\), length, FAX identifier, version, spatial resolution. )]TJ
+T*
+0.0003 Tc
+-0.0004 Tw
+[(The above term)8.4(s are defined as follows: )]TJ
+0 -1.4846 TD
+0.0002 Tc
+0.0747 Tw
+[(Length: )125( )-4633.6(\(Two octets\) Total APP1 field octet count including the octet count itself, but)-6.9( )]TJ
+8.2676 -1.1497 TD
+0.0006 Tc
+-0.0032 Tw
+[(excluding th)5.7(e APP1 )-7.5(m)8.7(a)-0.4(r)-6.3(k)0.7(er. )]TJ
+-8.2676 -1.4846 TD
+0.0013 Tc
+0.0291 Tw
+[(FAX )30.5(identif)4.4(ier)4.4(:)4.2( )-144.5( )-784.3( )-309.4(\(Six octe)5.3(ts\) X')6.5(47')6.5(,)-3.6( X')6.5(33')6.5(,)-3.6( X')6.5(46')6.5(,)1.4( X')6.5(41', X')6.5(58')6.5(,)1.4( X')6.5(00')6.5(.)1.4( This X')6.5(00'-term)9.4(inated strin)6.4(g)6.4( )]TJ
+8.2676 -1.1447 TD
+0.0007 Tc
+-0.0033 Tw
+[("G3FAX" uniquely iden)5.8(tif)3.8(ies this A)8.1(PP1 )-7.5(m)8.8(a)-0.3(rker. )]TJ
+-8.2676 -1.4846 TD
+0.0003 Tc
+0.3349 Tw
+[(Version: )-934.4( )-1064.3( )-479.5( \(Two octets\) X')5.5(07CA')5.5(.)-4.6( This string specifies the year of approval of the )]TJ
+8.2676 -1.1497 TD
+0 Tc
+-0.0001 Tw
+[(standard, for identification in the case of future revision \(for exam)8.1(ple, 1994\). )]TJ
+-8.2676 -1.4846 TD
+0.0002 Tc
+0.0701 Tw
+[(Spatial )70.4(Resolution: )275.3( )-269.5(\(Two octets\) Lightness pixel density in pels/25.4 mm. The basic value is 200. )]TJ
+8.2676 -1.1447 TD
+-0.0001 Tc
+0.099 Tw
+[(Any square resolution value \(i.e., the sam)8(e)-1.1( vertical and horizontal resolution\) )]TJ
+0 -1.1497 TD
+0.0001 Tc
+0.0001 Tw
+[(as defined in Table 2/T.30 m)8.2(a)-0.9(y be used \(e.g., 100, 200, 300, 400, etc.\). )]TJ
+10.98 0 0 10.98 56.7 530.1803 Tm
+0.0009 Tc
+0.1316 Tw
+[(NOTE )131.1(– )131.1(The functional equivalence of inch-based a)-3.3(nd mm-bas)-3.4(e)2.1(d resolutions is )-5.5(maintained. For exa)-3.3(m)8.2(ple)-3.3(,)-0.5( )]TJ
+0 -1.153 TD
+0.0012 Tc
+0.0002 Tw
+[(the 200 × 2)3.9(0)-1.5(0)3.9( pels/25.4 m)8.5(m)8.5( )-5.4(and 8/7.7 )5.5(li)5.8(nes/mm)8.5( resolutions are equivalent. )]TJ
+12.0035 0 0 12.0035 56.7 497.9603 Tm
+-0.0003 Tc
+0.1295 Tw
+[(An exam)7.8(ple)-6.3( of the string including the SOI and APP1 codes for a baseline JPEG encoded 1994 )]TJ
+0 -1.1497 TD
+-0.0001 Tc
+0.001 Tw
+[(G3FAX application at 200 pels/25.4 mm)8(: )]TJ
+0 -1.6495 TD
+0.0014 Tc
+0.0015 Tw
+[(X'FFD8')6.6(, X'FFE1')6.6(, X')6.6(000C')6.6(,)1.5( X')6.6(47')6.6(,)1.5( X')6.6(33')6.6(,)1.5( X')6.6(46')6.6(,)-3.5( X')6.6(41')6.6(,)1.5( X')6.6(58', X')6.6(00')6.6(,)1.5( X')6.6(07CA')6.6(,)1.5( X')6.6(00C8')6.6(.)1.5( )]TJ
+/TT4 1 Tf
+12 0 0 12 56.7 442.4003 Tm
+0.0001 Tc
+-0.0009 Tw
+[(E.6.6 )-895.8(FAX option identifier: G3FAX1 for gamut range )]TJ
+/TT2 1 Tf
+12.0035 0 0 12.0035 56.7 422.7803 Tm
+0.0002 Tc
+-0.0003 Tw
+[(X'FFE1')5.4( \(APP1\), length, G3FAX option identifier, gam)8.3(u)0.3(t range data. )]TJ
+T*
+0.0003 Tc
+[(The above term)8.4(s are defined as follows: )]TJ
+0 -1.4846 TD
+0.0002 Tc
+0.0142 Tw
+[(Length: )64.5( )-1390.1( )-1385.1( )-1390.1( )-465.4(\(Two octets\) Total APP1 field octet count including the octet count itself, but )]TJ
+8.9973 -1.1497 TD
+0.0006 Tc
+-0.0032 Tw
+[(excluding th)5.7(e APP1 )-7.5(m)8.7(a)-0.4(r)-6.3(k)0.7(er. )]TJ
+-8.9973 -1.4846 TD
+0.0011 Tc
+0.2349 Tw
+[(FAX )236.1(identif)4.2(ier)4.2(:)4( )61.1( )-1168.5( )-243.8(\(Six octets)5.4(\))4.2( X')6.3(47')6.3(,)-3.8( X')6.3(33')6.3(,)1.2( X')6.3(46', X')6.3(41')6.3(,)1.2( X'58')6.3(,)1.2( X')6.3(01')6.3(.)1.2( This X')6.3(01')6.3(-)-0.8(term)9.2(inated)6.2( )]TJ
+8.9973 -1.1447 TD
+0.0001 Tc
+0.1892 Tw
+[(string "G3FAX" uniquely identifies this APP1 m)8.2(a)-0.9(rker as containing FAX)7.5( )]TJ
+0 -1.1497 TD
+-0.0001 Tc
+0.0095 Tw
+[(inform)8(ation about optional gam)8(u)0(t range data. \(The FAX option identifiers are )]TJ
+T*
+0.0003 Tc
+0.2995 Tw
+[(referred to as G3FAX1-G3FAX255, m)8.4(eaning the octet-term)8.4(inated string )]TJ
+T*
+-0.0001 Tc
+0.005 Tw
+[("G3FAX", X')5.1(nn')5.1(.)0(\) )]TJ
+-8.9973 -1.4846 TD
+0.0001 Tc
+0.1898 Tw
+[(Ga)-5.9(m)8.2(u)0.2(t )190(range )190(data: )-444.8( )-289.9(\(Twelve octets\) The data field contains six tw)7.5(o-octet signed integers. For)-6.8( )]TJ
+8.9973 -1.1497 TD
+-0.0002 Tc
+0.0701 Tw
+[(exam)7.9(ple, X'0064')5( represents 100. The calculation from)7.9( a real value L* to an )]TJ
+T*
+0.0002 Tc
+-0.0003 Tw
+[(eight bit value, L, is m)8.3(a)-5.8(de as follows: )]TJ
+-8.9973 -1.4846 TD
+-0.0001 Tc
+-0.0008 Tw
+[( )-3059.9( )-1405.4( )-1400.4( )-1405.4( )-480.7(L = \(255/Q\) × L* + P )]TJ
+0 -1.4796 TD
+0.0008 Tc
+0.0277 Tw
+[( )-3030.5( )-1376( )-1371( )-1376( )-451.3(where the)4.8( f)3.9(i)3.7(rst integ)5.9(e)-0.2(r o)5.9(f)3.9( the f)3.9(i)-1.3(rs)5.1(t pa)4.8(ir, P, conta)4.8(i)3.7(ns the)4.8( of)3.9(f)3.9(s)0.1(et of)3.9( the z)4.8(e)-0.2(ro point )]TJ
+8.9973 -1.1497 TD
+0.0081 Tw
+[(in L* in the eight m)8.9(o)0.9(st signif)3.9(i)-1.3(can)5.9(t b)5.9(i)3.7(ts. The)4.8( seco)5.9(nd integer)3.9( o)5.9(f)3.9( the f)3.9(i)-1.3(rs)5.1(t p)5.9(a)4.8(ir, Q,)5.9( )]TJ
+T*
+0.0002 Tc
+0.0093 Tw
+[(contains the span of the gam)8.3(u)0.3(t range in L*. Rounding to the nearest integer is )]TJ
+T*
+-0.0001 Tc
+0.0191 Tw
+[(perform)8(e)-1.1(d. The second pair contains offset and range values for a*. The third )]TJ
+T*
+0.0002 Tc
+0.2696 Tw
+[(pair contains offset and range values for b*. If the im)8.3(a)-5.8(g)0.3(e is gray-scale )]TJ
+T*
+0.0001 Tc
+-0.0013 Tw
+(\(L* only\), the field still contains six integers, but the last four are ignored. )Tj
+10.98 0 0 10.98 164.7 131.4803 Tm
+0.0007 Tc
+0.1318 Tw
+[(NOTE )131.1(– )131.1(This representatio)-7.5(n is in accord with ITU-T Rec. T.42. When the twelve )]TJ
+0 -1.1475 TD
+0.0009 Tc
+0.0879 Tw
+[(bits/pel/com)8.2(p)-7.3(onent o)3.6(p)-1.8(tio)3.6(n )5.5(is used, the r)6(a)2.1(nge and offs)7.5(et are represented as abov)3.6(e in)3.6( )]TJ
+0 -1.153 TD
+0.0006 Tc
+0.0335 Tw
+[(eight bits. These r)-5.2(e)1.8(pres)-3.7(ent the eight )-5.5(m)7.9(o)-2.1(s)-3.7(t)-0.3( significant bits of the ze)-3.6(ro-padded twelve-)]TJ
+T*
+0.0225 Tw
+[(bit num)8(ber in)-7.5( the offset, an)-7.5(d the eight-bi)5.3(t)-0.2( integer range data )-5.5(as abo)-7.5(v)-2(e. Appropriatel)5.3(y)-2( )]TJ
+T*
+0.0011 Tc
+0.0003 Tw
+[(higher precision calculation shoul)5.7(d be u)3.8(sed. )]TJ
+ET

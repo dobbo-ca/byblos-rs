@@ -1,0 +1,15 @@
+q Q q 0 20 1024 768 re W n /Cs1 cs 1 sc 0 20 1024 768 re f 0.6000000 i 0 20 1024 768
+re f /Perceptual ri q 144 0 0 60 867 24 cm /Im1 Do Q q 153 0 0 55 712 27 cm
+/Im2 Do Q q 1024 0 0 1023 0 -219 cm /Im3 Do Q Q q 110 320 803 55 re W n /Cs2
+cs 0.4000000 0.8000000 1 sc 0.6000000 i q 1 0 0 -1 110 375 cm BT 48 0 0 -48 8.089844 46
+Tm /F1.0 1 Tf (Another Go at Language Design) Tj ET Q Q q 337 137 349 153
+re W n /Cs2 cs 1 0.8000000 0.4000000 sc 0.6000000 i q 1 0 0 -1 337 290 cm
+BT 36 0 0 -36 99.33594 38 Tm /F2.0 1 Tf (Rob Pike) Tj ET Q q 1 0 0 -1 337 290
+cm BT 32 0 0 -32 78.48438 80 Tm /F3.0 1 Tf (golang.org) Tj ET Q q 1 0 0 -1 337 290
+cm BT 36 0 0 -36 47.60352 127 Tm /F2.0 1 Tf (April 28, 2010) Tj ET Q Q q 0 20 1024 768
+re W n /Perceptual ri q 200 0 0 100 832 7 cm /Im4 Do Q q 153 0 0 55 702 30
+cm /Im5 Do Q /Cs2 cs 0.4000000 0.8000000 1 sc /RelativeColorimetric ri q 1 0 0 -1 27.08838 94
+cm BT 32 0 0 -32 38.77344 36 Tm /F3.0 1 Tf (http://golang.org) Tj ET Q Q q
+0.3000000 SC 0 20 1024 768 re S /Gs1 gs /Cs1 cs 1 sc 2 3 163 15 re f Q q 2 3 163 15
+re W n /Cs1 cs 0 sc q 1 0 0 -1 2 18 cm BT 0.010000000 Tc 12 0 0 -12 5 11 Tm
+/F4.0 1 Tf (Wednesday, April 28, 2010) Tj 0 Tc ET Q Q

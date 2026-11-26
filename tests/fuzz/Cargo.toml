@@ -1,0 +1,204 @@
+[package]
+name = "byblos-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+byblos = { path = "../.." }
+libfuzzer-sys = "0.4"
+
+# Not part of the root package: only this crate may depend on libfuzzer-sys.
+[workspace]
+
+[[bin]]
+name = "go_sort"
+path = "fuzz_targets/go_sort.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "build_pdf"
+path = "fuzz_targets/build_pdf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cff"
+path = "fuzz_targets/cff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_lexer"
+path = "fuzz_targets/content_lexer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_walk"
+path = "fuzz_targets/content_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dct_parse"
+path = "fuzz_targets/dct_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "embed_jp2"
+path = "fuzz_targets/embed_jp2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "embed_jpeg"
+path = "fuzz_targets/embed_jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "embed_png"
+path = "fuzz_targets/embed_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extract"
+path = "fuzz_targets/extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_decode"
+path = "fuzz_targets/image_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inspect"
+path = "fuzz_targets/inspect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jbig2_decode"
+path = "fuzz_targets/jbig2_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jbig2_decode_globals"
+path = "fuzz_targets/jbig2_decode_globals.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jbig2_roundtrip"
+path = "fuzz_targets/jbig2_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "optimize"
+path = "fuzz_targets/optimize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pixels"
+path = "fuzz_targets/pixels.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provenance_json"
+path = "fuzz_targets/provenance_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "render"
+path = "fuzz_targets/render.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sfnt"
+path = "fuzz_targets/sfnt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transcode_png"
+path = "fuzz_targets/transcode_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type1"
+path = "fuzz_targets/type1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmp"
+path = "fuzz_targets/xmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stamp"
+path = "fuzz_targets/stamp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replace_images"
+path = "fuzz_targets/replace_images.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "build_from_pages"
+path = "fuzz_targets/build_from_pages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provenance"
+path = "fuzz_targets/provenance.rs"
+test = false
+doc = false
+bench = false

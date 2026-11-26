@@ -1,0 +1,306 @@
+ /P <</MCID 0>> BDC q
+0 0.00018311 793.8 595.2 re
+W* n
+/Pattern cs /P96 scn
+0 -0.049927 793.75 595.25 re
+f*
+Q
+ EMC  /P <</MCID 1/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F1 44.04 Tf
+1 0 0 1 171.36 531 Tm
+1 g
+/GS9 gs
+1 G
+[(Differences from)3( C++)] TJ
+ET
+Q
+ EMC  /P <</MCID 2>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F1 44.04 Tf
+1 0 0 1 616.63 531 Tm
+1 g
+1 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 3/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.04 Tf
+1 0 0 1 39.624 425.26 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 425.26 Tm
+0 g
+0 G
+[(No con)3(structor)4(s)] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 290.83 425.26 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 4/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.064 Tf
+1 0 0 1 39.624 375.58 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 66.624 375.58 Tm
+0 g
+0 G
+[(No d)5(estru)4(ction)5(s )11(\(th)3(an)4(ks )6(to)3( g)3(arb)4(ag)4(e )7(colle)5(ction)5(\))] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 716.76 375.58 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 5/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.04 Tf
+1 0 0 1 39.624 325.87 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 325.87 Tm
+0 g
+0 G
+[(No p)3(oin)4(ter )7(arit)3(hm)3(eti)4(c)] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 361.51 325.87 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 6/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.04 Tf
+1 0 0 1 39.624 276.07 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 276.07 Tm
+0 g
+0 G
+[(Arrays )6(are)3( )5(first )5(class )5(value)4(s )] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 466.3 276.07 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 66.624 240.41 Tm
+0 g
+0 G
+[(\(pa)4(ssed )10(by )5(valu)4(e )7(to)3( fu)4(nctio)5(ns\))] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 491.26 240.41 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 7/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.04 Tf
+1 0 0 1 39.624 190.73 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 190.73 Tm
+0 g
+0 G
+[(No im)4(pli)4(cit type)3( )5(conversion)] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 447.1 190.73 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 154.97 Tm
+0 g
+0 G
+[(All conversion)3(s )10(mu)3(st )4(be)3( )5(expli)4(cit)] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 510.82 154.97 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC  /P <</MCID 8/Lang (en-US)>> BDC q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.064 Tf
+1 0 0 1 39.624 106.82 Tm
+0 g
+0 G
+[<0087>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F5 32.064 Tf
+1 0 0 1 66.624 106.82 Tm
+0 g
+0 G
+ -0.0384 Tc[(nil)] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 124.25 106.82 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F4 32.064 Tf
+1 0 0 1 133.25 106.82 Tm
+0 g
+0 G
+[<00B300450048>4<004F0052>3<0051004A>4<005600B40003>3<00570052>3<0003>5<0044004F>3<004F000300530052004C>4<00510057>3<004800550003>3<0057005C00530048>4<0056>] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.064 Tf
+1 0 0 1 534.82 106.82 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+q
+0 0 793.8 595.2 re
+W* n
+BT
+/F2 32.04 Tf
+1 0 0 1 66.624 55.464 Tm
+0 g
+0 G
+[( )] TJ
+ET
+Q
+ EMC 

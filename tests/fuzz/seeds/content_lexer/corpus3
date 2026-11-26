@@ -1,0 +1,23 @@
+q Q q 0 20 1024 768 re W n /Cs1 cs 1 sc 0 20 1024 768 re f 0.6000000 i /Cs2
+cs 1 1 1 sc 0 20 1024 768 re f /Perceptual ri q 144 0 0 60 867 24 cm /Im76
+Do Q q 153 0 0 55 702 29 cm /Im77 Do Q Q q 100 679 824 89 re W n /Cs2 cs 0
+0 1 sc 0.6000000 i q 1 0 0 -1 100 768 cm BT 48 0 0 -48 298.0703 62 Tm /F1.0
+1 Tf (Channels) Tj ET Q Q q 0 20 1024 768 re W n /Cs1 cs 0 sc q 1 0 0 -1 49.84521 655
+cm BT 32 0 0 -32 4 34 Tm /F2.0 1 Tf (Goroutines communicate using channels.)
+Tj ET Q /Cs2 cs 0.1568628 0.3215686 0.5647059 sc q 1 0 0 -1 49.84521 655 cm
+BT 24 0 0 -24 4 102 Tm /F3.0 1 Tf (func computeAndSend\(x, y, z int\) chan int {)
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 134 Tm /F3.0 1 Tf (   ch := make\(chan int\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 166 Tm /F3.0 1 Tf (   go func\(\) {)
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 198 Tm /F3.0 1 Tf (      ch <- expensiveComputation\(x, y, z\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 230 Tm /F3.0 1 Tf (   }\(\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 262 Tm /F3.0 1 Tf (   return ch)
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 294 Tm /F3.0 1 Tf (}) Tj
+ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 358 Tm /F3.0 1 Tf (func main\(\) {)
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 390 Tm /F3.0 1 Tf (   ch := computeAndSend\(x, y, z\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 422 Tm /F3.0 1 Tf (   v2 := anotherExpensiveComputation\(a, b, c\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 454 Tm /F3.0 1 Tf (   v1 := <-ch)
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 486 Tm /F3.0 1 Tf (   fmt.Println\(v1, v2\))
+Tj ET Q q 1 0 0 -1 49.84521 655 cm BT 24 0 0 -24 4 518 Tm /F3.0 1 Tf (}) Tj
+ET Q Q q 0.3000000 SC 0 20 1024 768 re S /Gs1 gs /Cs1 cs 1 sc 2 3 163 15 re
+f Q q 2 3 163 15 re W n /Cs1 cs 0 sc q 1 0 0 -1 2 18 cm BT 0.010000000 Tc
+12 0 0 -12 5 11 Tm /F4.0 1 Tf (Wednesday, April 28, 2010) Tj 0 Tc ET Q Q

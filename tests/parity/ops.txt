@@ -1,0 +1,54 @@
+# Operations compared by diff.sh, one op token per line. An op's output files are named
+# <input-file-name>.<op>.out or <input-file-name>.<op>.err (docs/parity.md). A wave adds an op here
+# when the Rust side writes the same bytes as Go for it.
+# oracle-wave1: non-PDF ops (Rust side in examples/oracle/{image,build,jbig2,content}.rs).
+embed
+embed-tight
+rotation
+rotation-tight
+orientation
+orientation-tight
+build
+build-tight
+decode
+sauvola
+downsample-150
+downsample-150-tight
+downsample-bpc1
+jbig2-encode
+jbig2-image
+jbig2-decode
+jbig2-decode-globals
+lex
+walk
+walk-tight
+# Flate level 1 (transcode, transcode-tight: zlib.BestSpeed in pdfbuild/png.go) and level 9
+# (quantize-*: png.BestCompression), with pdf-rs's goflate::ZlibWriter (docs/needs-from-pdf-rs.md 2.1).
+transcode
+transcode-tight
+quantize-png-2
+quantize-png-16
+quantize-png-256
+quantize-indexed-16
+# PDF ops (oracle-pdf; Rust side in examples/oracle/pdf.rs).
+inspect
+inspect-tight
+extract
+extract-tight
+record
+record-tight
+render
+render-tight
+optimize
+optimize-tight
+optimize-lin
+optimize-jpeg75
+optimize-lin-jpeg75
+stamp
+stamp-tight
+replace
+replace-tight
+edit
+edit-tight
+provenance-write
+provenance-read
